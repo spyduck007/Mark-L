@@ -672,6 +672,11 @@ class JarvisLive:
         self._voice_engine: VoiceAudioEngine | None = None
         self._mic_queue: asyncio.Queue | None = None
         self._local_speech_active = False
+        self._barge_in_candidate_since = 0.0
+        self._barge_in_buffer = deque(maxlen=12)
+        self._barge_in_min_duration = 0.32
+        self._barge_in_min_rms = 450.0
+        self._barge_in_grace_seconds = 0.25
         self._speech_started_at = 0.0
         self._speech_ended_at = 0.0
         self._last_playback_started_at = 0.0
@@ -691,6 +696,15 @@ class JarvisLive:
         except Exception:
             _voice_cfg = {}
         self._speaker_enabled = bool(_voice_cfg.get("speaker_verification_enabled", False))
+        self._barge_in_min_duration = max(0.15, min(1.0, float(
+            _voice_cfg.get("barge_in_min_duration_seconds", 0.32)
+        )))
+        self._barge_in_min_rms = max(100.0, float(
+            _voice_cfg.get("barge_in_min_rms", 450.0)
+        ))
+        self._barge_in_grace_seconds = max(0.0, min(1.0, float(
+            _voice_cfg.get("barge_in_grace_seconds", 0.25)
+        )))
         self._speaker_identity = SpeakerIdentity(
             VOICE_MODEL_DIR / "3dspeaker-owner.onnx",
             SPEAKER_PROFILE_PATH,
@@ -922,9 +936,15 @@ class JarvisLive:
             self._loop
         )
 
+    def _reset_barge_in_candidate(self) -> None:
+        self._barge_in_candidate_since = 0.0
+        self._barge_in_buffer.clear()
+
     def set_speaking(self, value: bool):
         with self._speaking_lock:
             self._is_speaking = value
+        if not value:
+            self._reset_barge_in_candidate()
         if value:
             self._set_dialogue_state(DialogueState.ASSISTANT_SPEAKING, "audio playback")
         elif not self.ui.muted:
@@ -937,6 +957,10 @@ class JarvisLive:
 
     def interrupt(self, auto: bool = False) -> None:
         """Stop JARVIS mid-speech and let explicit activity interrupt the model."""
+        if auto:
+            with self._speaking_lock:
+                if not self._is_speaking or self._interrupted:
+                    return
         self._interrupted = True
         self._voice_metrics.increment("interruptions")
         if self._last_playback_started_at:
@@ -1432,8 +1456,12 @@ class JarvisLive:
             if not self._voice_engine:
                 await asyncio.sleep(0)
                 continue
+            with self._speaking_lock:
+                playback_active = self._is_speaking
             try:
-                event = await asyncio.to_thread(self._voice_engine.process_microphone, raw)
+                event = await asyncio.to_thread(
+                    self._voice_engine.process_microphone, raw, playback_active
+                )
             except Exception as exc:
                 print(f"[VoiceEngine] process error: {exc}")
                 continue
@@ -1470,7 +1498,47 @@ class JarvisLive:
             if not self._wake_operational and not self._wake_gate_open.is_set():
                 self._wake_gate_open.set()
 
-            if event.speech_started and not self._local_speech_active:
+            # A VAD hit during playback is not enough to interrupt: the speakers
+            # themselves contain speech. Require sustained residual speech that
+            # does not closely match the exact audio JARVIS is playing.
+            if playback_active and not self._local_speech_active:
+                now = time.monotonic()
+                in_playback_grace = bool(
+                    self._last_playback_started_at
+                    and now - self._last_playback_started_at < self._barge_in_grace_seconds
+                )
+                is_candidate = (
+                    not in_playback_grace
+                    and event.is_speech
+                    and not event.likely_echo
+                    and event.rms >= self._barge_in_min_rms
+                )
+                if is_candidate:
+                    if not self._barge_in_candidate_since:
+                        self._barge_in_candidate_since = now
+                    self._barge_in_buffer.append(data)
+                    if now - self._barge_in_candidate_since >= self._barge_in_min_duration:
+                        buffered_audio = list(self._barge_in_buffer)
+                        speech_started_at = self._barge_in_candidate_since
+                        self._local_speech_active = True
+                        self._current_user_audio = bytearray()
+                        self._speech_started_at = speech_started_at
+                        self._voice_metrics.increment("vad_starts")
+                        self._set_dialogue_state(DialogueState.USER_SPEAKING, "confirmed barge-in")
+                        self.interrupt(auto=True)
+                        await self._send_activity_start()
+                        for buffered in buffered_audio:
+                            self._current_user_audio.extend(buffered)
+                            self._queue_realtime_audio(buffered)
+                        self._reset_barge_in_candidate()
+                    continue
+                self._reset_barge_in_candidate()
+                continue
+
+            if not playback_active:
+                self._reset_barge_in_candidate()
+
+            if event.is_speech and not self._local_speech_active:
                 self._local_speech_active = True
                 self._current_user_audio = bytearray()
                 self._speech_started_at = time.monotonic()
@@ -1996,18 +2064,49 @@ class JarvisLive:
             self._phone_active = True
             if self.ui.muted or not self._voice_engine:
                 continue
+            with self._speaking_lock:
+                playback_active = self._is_speaking
             try:
-                event = await asyncio.to_thread(self._voice_engine.process_microphone, chunk["data"])
+                event = await asyncio.to_thread(
+                    self._voice_engine.process_microphone, chunk["data"], playback_active
+                )
             except Exception as exc:
                 print(f"[Phone] Voice processing error: {exc}")
                 continue
 
-            if event.speech_started and not self._phone_speech_active:
+            if playback_active and not self._phone_speech_active:
+                now = time.monotonic()
+                in_playback_grace = bool(
+                    self._last_playback_started_at
+                    and now - self._last_playback_started_at < self._barge_in_grace_seconds
+                )
+                is_candidate = (
+                    not in_playback_grace
+                    and event.is_speech
+                    and not event.likely_echo
+                    and event.rms >= self._barge_in_min_rms
+                )
+                if is_candidate:
+                    if not self._barge_in_candidate_since:
+                        self._barge_in_candidate_since = now
+                    self._barge_in_buffer.append(event.audio)
+                    if now - self._barge_in_candidate_since >= self._barge_in_min_duration:
+                        buffered_audio = list(self._barge_in_buffer)
+                        self._phone_speech_active = True
+                        self.interrupt(auto=True)
+                        await self._send_activity_start()
+                        for buffered in buffered_audio:
+                            self._queue_realtime_audio(buffered)
+                        self._reset_barge_in_candidate()
+                    continue
+                self._reset_barge_in_candidate()
+                continue
+
+            if not playback_active:
+                self._reset_barge_in_candidate()
+
+            if event.is_speech and not self._phone_speech_active:
                 self._phone_speech_active = True
-                with self._speaking_lock:
-                    speaking = self._is_speaking
-                if speaking:
-                    self.interrupt(auto=True)
                 await self._send_activity_start()
 
             if self._phone_speech_active:

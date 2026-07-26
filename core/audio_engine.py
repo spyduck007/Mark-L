@@ -26,6 +26,10 @@ class VoiceEvent:
     speech_ended: bool = False
     is_speech: bool = False
     rms: float = 0.0
+    raw_rms: float = 0.0
+    echo_correlation: float = 0.0
+    residual_ratio: float = 1.0
+    likely_echo: bool = False
 
 
 def _download_once(url: str, destination: Path) -> Path:
@@ -169,15 +173,14 @@ class WebRtcAudioConditioner:
             return output
 
 
-class AdaptiveEchoSuppressor:
-    """Dependency-free playback-reference suppressor used when WebRTC is unavailable."""
+class EchoReferenceTracker:
+    """Tracks recent playback and aligns microphone frames against it."""
 
-    def __init__(self, sample_rate: int = 16000, stream_delay_ms: int = 80):
+    def __init__(self, sample_rate: int = 16000, max_history_seconds: float = 4.0):
         from collections import deque
 
         self.sample_rate = sample_rate
-        self.delay_samples = max(0, int(sample_rate * stream_delay_ms / 1000))
-        self._reference = deque(maxlen=sample_rate * 4)
+        self._reference = deque(maxlen=max(1, int(sample_rate * max_history_seconds)))
         self._lock = threading.RLock()
 
     def feed_playback(self, pcm_bytes: bytes, source_rate: int) -> None:
@@ -186,26 +189,88 @@ class AdaptiveEchoSuppressor:
         with self._lock:
             self._reference.extend(int(v) for v in samples)
 
-    def process_capture(self, pcm_bytes: bytes) -> bytes:
+    def best_match(
+        self,
+        capture: np.ndarray,
+        max_delay_ms: int = 700,
+    ) -> tuple[np.ndarray | None, float, float]:
+        """Return the best aligned playback window, correlation, and gain."""
+        if capture.size < 64:
+            return None, 0.0, 0.0
+        with self._lock:
+            reference = np.asarray(self._reference, dtype=np.float32)
+        required = capture.size + int(self.sample_rate * max_delay_ms / 1000)
+        if reference.size < min(required, capture.size * 2):
+            return None, 0.0, 0.0
+
+        centered_capture = capture.astype(np.float32) - float(np.mean(capture))
+        capture_norm = float(np.linalg.norm(centered_capture))
+        if capture_norm < 1.0:
+            return None, 0.0, 0.0
+
+        max_delay = min(
+            int(self.sample_rate * max_delay_ms / 1000),
+            reference.size - capture.size,
+        )
+        step = max(64, capture.size // 8)
+        best_window = None
+        best_corr = 0.0
+        best_gain = 0.0
+        for delay in range(0, max_delay + 1, step):
+            end = reference.size - delay
+            start = end - capture.size
+            if start < 0:
+                break
+            window = reference[start:end]
+            centered_window = window - float(np.mean(window))
+            window_norm = float(np.linalg.norm(centered_window))
+            if window_norm < 1.0:
+                continue
+            corr = abs(float(np.dot(centered_capture, centered_window))) / (
+                capture_norm * window_norm
+            )
+            if corr <= best_corr:
+                continue
+            energy = float(np.dot(window, window))
+            gain = float(np.dot(capture, window) / energy) if energy > 1.0 else 0.0
+            best_window = window.copy()
+            best_corr = corr
+            best_gain = max(-1.5, min(1.5, gain))
+
+        return best_window, best_corr, best_gain
+
+    def clear(self) -> None:
+        with self._lock:
+            self._reference.clear()
+
+
+class AdaptiveEchoSuppressor:
+    """Dependency-free playback-reference suppressor used when WebRTC is unavailable."""
+
+    def __init__(self, tracker: EchoReferenceTracker):
+        self._tracker = tracker
+
+    def process_capture(self, pcm_bytes: bytes) -> tuple[bytes, float]:
         capture = np.frombuffer(
             pcm_bytes[: len(pcm_bytes) - len(pcm_bytes) % 2], dtype="<i2"
         ).astype(np.float32)
         if capture.size == 0:
-            return pcm_bytes
-        with self._lock:
-            available = len(self._reference) - self.delay_samples
-            if available < capture.size:
-                return pcm_bytes
-            reference = np.asarray(list(self._reference), dtype=np.float32)
-            end = reference.size - self.delay_samples if self.delay_samples else reference.size
-            reference = reference[end - capture.size : end]
-        energy = float(np.dot(reference, reference))
-        if energy < 1.0:
-            return pcm_bytes
-        gain = float(np.dot(capture, reference) / energy)
-        gain = max(0.0, min(1.2, gain))
-        cleaned = capture - gain * reference
-        return np.clip(cleaned, -32768, 32767).astype("<i2").tobytes()
+            return pcm_bytes, 0.0
+
+        # A laptop speaker-to-microphone path is a short room impulse response,
+        # not one perfectly delayed copy. Remove a few strongest aligned paths;
+        # near-end user speech remains in the residual while playback echo falls.
+        residual = capture.copy()
+        strongest_correlation = 0.0
+        for _ in range(4):
+            reference, correlation, gain = self._tracker.best_match(residual)
+            strongest_correlation = max(strongest_correlation, correlation)
+            if reference is None or correlation < 0.12 or abs(gain) < 0.01:
+                break
+            residual -= gain * reference
+
+        cleaned = np.clip(residual, -32768, 32767).astype("<i2").tobytes()
+        return cleaned, strongest_correlation
 
 
 class VoiceAudioEngine:
@@ -224,6 +289,7 @@ class VoiceAudioEngine:
             sample_rate=sample_rate,
             threshold=vad_threshold,
         )
+        self._echo_reference = EchoReferenceTracker(sample_rate)
         self.conditioner = None
         self.conditioner_error = None
         self.conditioner_backend = "disabled"
@@ -233,21 +299,56 @@ class VoiceAudioEngine:
                 self.conditioner_backend = "webrtc"
             except Exception as exc:
                 self.conditioner_error = str(exc)
-                self.conditioner = AdaptiveEchoSuppressor(sample_rate, stream_delay_ms)
+                self.conditioner = AdaptiveEchoSuppressor(self._echo_reference)
                 self.conditioner_backend = "adaptive-fallback"
 
     def feed_playback(self, pcm_bytes: bytes, source_rate: int = 24000) -> None:
-        if self.conditioner:
+        self._echo_reference.feed_playback(pcm_bytes, source_rate)
+        if self.conditioner_backend == "webrtc" and self.conditioner:
             self.conditioner.feed_playback(pcm_bytes, source_rate)
 
-    def process_microphone(self, pcm_bytes: bytes) -> VoiceEvent:
+    def process_microphone(self, pcm_bytes: bytes, playback_active: bool = False) -> VoiceEvent:
         with self._process_lock:
-            clean = self.conditioner.process_capture(pcm_bytes) if self.conditioner else pcm_bytes
+            raw_samples = np.frombuffer(
+                pcm_bytes[: len(pcm_bytes) - len(pcm_bytes) % 2], dtype="<i2"
+            ).astype(np.float32)
+            raw_rms = (
+                float(math.sqrt(np.mean(raw_samples.astype(np.float64) ** 2)))
+                if raw_samples.size else 0.0
+            )
+            correlation = 0.0
+            if (
+                playback_active
+                and self.conditioner_backend == "adaptive-fallback"
+                and self.conditioner
+            ):
+                clean, correlation = self.conditioner.process_capture(pcm_bytes)
+            else:
+                clean = self.conditioner.process_capture(pcm_bytes) if self.conditioner else pcm_bytes
+                if playback_active and raw_samples.size:
+                    _, correlation, _ = self._echo_reference.best_match(raw_samples)
+
             samples = np.frombuffer(clean[: len(clean) - len(clean) % 2], dtype="<i2")
             rms = float(math.sqrt(np.mean(samples.astype(np.float64) ** 2))) if samples.size else 0.0
+            residual_ratio = rms / max(raw_rms, 1.0)
+            likely_echo = playback_active and (
+                correlation >= 0.88
+                or (correlation >= 0.35 and residual_ratio <= 0.55)
+            )
             started, ended, is_speech = self.vad.process(clean)
-            return VoiceEvent(clean, started, ended, is_speech, rms)
+            return VoiceEvent(
+                clean,
+                started,
+                ended,
+                is_speech,
+                rms,
+                raw_rms,
+                correlation,
+                residual_ratio,
+                likely_echo,
+            )
 
     def reset(self) -> None:
         with self._process_lock:
             self.vad.reset()
+            self._echo_reference.clear()
