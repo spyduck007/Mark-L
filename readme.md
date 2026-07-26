@@ -104,6 +104,17 @@ python main.py
 
 > ⚠️ **Installation Note:** Some OS-specific dependencies are not bundled in `requirements.txt` to keep the repo lightweight. If you hit a `ModuleNotFoundError`, install the missing package with `pip install <module_name>`.
 
+### "Hey Jarvis" wake word
+
+MARK L can keep computer-microphone audio local until the configured wake phrase is detected.
+
+1. Create a free Picovoice account and copy its AccessKey.
+2. Open MARK L's controls drawer and choose **Wake Word Settings**.
+3. Paste the AccessKey, leave the phrase as **Hey Jarvis**, and select **Save & Reload**.
+4. The first run creates and caches a platform-specific `.ppn` model under `config/wake_words/`. After that, wake-word inference runs locally.
+
+While wake-word mode is armed, ordinary room audio is not forwarded to Gemini Live. Phone microphone and typed dashboard commands remain independent of the computer-microphone gate.
+
 ---
 
 ## 📋 Requirements

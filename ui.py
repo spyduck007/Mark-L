@@ -461,6 +461,10 @@ class HudCanvas(QWidget):
             return 0.56
         if self.state == "LISTENING":
             return 0.24
+        if self.state == "FOLLOW_UP":
+            return 0.18
+        if self.state == "STANDBY":
+            return 0.045
         return 0.12
 
     def _step(self):
@@ -739,6 +743,12 @@ class HudCanvas(QWidget):
         elif self.state == "LISTENING":
             symbol = "●" if self._blink else "○"
             text, color = f"{symbol}  LISTENING", qcol(C.GREEN)
+        elif self.state == "FOLLOW_UP":
+            symbol = "◌" if self._blink else "○"
+            text, color = f"{symbol}  FOLLOW-UP READY", qcol(C.GREEN_D)
+        elif self.state == "STANDBY":
+            symbol = "◌" if self._blink else "·"
+            text, color = f'{symbol}  STANDBY — SAY "HEY JARVIS"', qcol(C.PRI_DIM)
         else:
             symbol = "●" if self._blink else "○"
             text, color = f"{symbol}  {self.state}", qcol(C.PRI)
@@ -1582,6 +1592,159 @@ class CustomizeOverlay(QWidget):
         self.hide()
 
 
+class WakeWordOverlay(QWidget):
+    """Wake-word configuration panel backed by api_keys.json."""
+
+    saved = pyqtSignal(dict)
+    _OW, _OH = 440, 520
+
+    def __init__(self, config: dict, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            WakeWordOverlay {{
+                background: rgba(0, 6, 10, 248);
+                border: 1px solid {C.BORDER_B};
+                border-radius: 6px;
+            }}
+        """)
+        self._enabled = bool(config.get("wake_word_enabled", True))
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 18, 24, 18)
+        lay.setSpacing(7)
+
+        def label(text, size=8, color=C.TEXT_DIM, bold=False):
+            item = QLabel(text)
+            item.setFont(QFont("Courier New", size,
+                               QFont.Weight.Bold if bold else QFont.Weight.Normal))
+            item.setStyleSheet(f"color: {color}; background: transparent;")
+            item.setWordWrap(True)
+            return item
+
+        field_style = f"""
+            QLineEdit {{
+                background: #000d12; color: {C.TEXT};
+                border: 1px solid {C.BORDER}; border-radius: 3px;
+                padding: 4px 8px;
+            }}
+            QLineEdit:focus {{ border: 1px solid {C.PRI}; }}
+        """
+
+        lay.addWidget(label("◉  WAKE WORD SETTINGS", 12, C.PRI, True))
+        lay.addWidget(label(
+            "When enabled, room audio is processed locally by Porcupine and is not sent to Gemini until the wake phrase is detected.",
+            8, C.TEXT_MED,
+        ))
+
+        self._enabled_btn = QPushButton()
+        self._enabled_btn.setCheckable(True)
+        self._enabled_btn.setChecked(self._enabled)
+        self._enabled_btn.setFixedHeight(30)
+        self._enabled_btn.clicked.connect(self._toggle_enabled)
+        lay.addWidget(self._enabled_btn)
+        self._style_enabled()
+
+        lay.addWidget(label("WAKE PHRASE"))
+        self._phrase = QLineEdit(config.get("wake_phrase", "Hey Jarvis") or "Hey Jarvis")
+        self._phrase.setStyleSheet(field_style)
+        lay.addWidget(self._phrase)
+
+        lay.addWidget(label("PICOVOICE ACCESS KEY"))
+        self._access_key = QLineEdit(config.get("picovoice_access_key", "") or "")
+        self._access_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._access_key.setPlaceholderText("Paste the free AccessKey from Picovoice Console")
+        self._access_key.setStyleSheet(field_style)
+        lay.addWidget(self._access_key)
+
+        lay.addWidget(label("CUSTOM .PPN MODEL  (optional — auto-trained when blank)"))
+        model_row = QHBoxLayout(); model_row.setSpacing(5)
+        self._model_path = QLineEdit(config.get("wake_word_model_path", "") or "")
+        self._model_path.setPlaceholderText("Leave blank to create/cache Hey Jarvis automatically")
+        self._model_path.setStyleSheet(field_style)
+        model_row.addWidget(self._model_path)
+        browse = QPushButton("BROWSE")
+        browse.setFixedSize(68, 28)
+        browse.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        browse.setStyleSheet(f"color: {C.PRI}; border: 1px solid {C.BORDER_B}; background: transparent;")
+        browse.clicked.connect(self._browse_model)
+        model_row.addWidget(browse)
+        lay.addLayout(model_row)
+
+        numbers = QHBoxLayout(); numbers.setSpacing(8)
+        left = QVBoxLayout(); left.setSpacing(3)
+        left.addWidget(label("SENSITIVITY  0.0–1.0"))
+        self._sensitivity = QLineEdit(str(config.get("wake_word_sensitivity", 0.55)))
+        self._sensitivity.setStyleSheet(field_style); left.addWidget(self._sensitivity)
+        numbers.addLayout(left)
+        right = QVBoxLayout(); right.setSpacing(3)
+        right.addWidget(label("FOLLOW-UP WINDOW  seconds"))
+        self._timeout = QLineEdit(str(config.get("follow_up_timeout_seconds", 10)))
+        self._timeout.setStyleSheet(field_style); right.addWidget(self._timeout)
+        numbers.addLayout(right)
+        lay.addLayout(numbers)
+
+        lay.addWidget(label(
+            "The first automatic custom-model creation needs internet access. After the .ppn file is cached, detection runs locally.",
+            7, C.ACC2,
+        ))
+        lay.addStretch()
+
+        buttons = QHBoxLayout(); buttons.setSpacing(8)
+        save = QPushButton("▸  SAVE & RELOAD")
+        save.setFixedHeight(34)
+        save.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        save.setStyleSheet(f"color: {C.PRI}; border: 1px solid {C.PRI_DIM}; background: transparent;")
+        save.clicked.connect(self._save)
+        buttons.addWidget(save)
+        cancel = QPushButton("CANCEL")
+        cancel.setFixedHeight(34)
+        cancel.setStyleSheet(f"color: {C.TEXT_MED}; border: 1px solid {C.BORDER}; background: transparent;")
+        cancel.clicked.connect(self.hide)
+        buttons.addWidget(cancel)
+        lay.addLayout(buttons)
+
+    def _toggle_enabled(self, checked: bool):
+        self._enabled = bool(checked)
+        self._style_enabled()
+
+    def _style_enabled(self):
+        if self._enabled:
+            self._enabled_btn.setText("◉  WAKE WORD: ENABLED")
+            self._enabled_btn.setStyleSheet(
+                f"color: {C.GREEN}; background: #00140a; border: 1px solid {C.GREEN_D}; border-radius: 3px;"
+            )
+        else:
+            self._enabled_btn.setText("○  WAKE WORD: DISABLED — CONTINUOUS LISTENING")
+            self._enabled_btn.setStyleSheet(
+                f"color: {C.ACC2}; background: #161000; border: 1px solid {C.ACC2}; border-radius: 3px;"
+            )
+
+    def _browse_model(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select Porcupine keyword", "", "Porcupine Keyword (*.ppn)")
+        if path:
+            self._model_path.setText(path)
+
+    def _save(self):
+        try:
+            sensitivity = max(0.0, min(1.0, float(self._sensitivity.text().strip() or "0.55")))
+            timeout = max(2.0, min(60.0, float(self._timeout.text().strip() or "10")))
+        except ValueError:
+            self._sensitivity.setStyleSheet(self._sensitivity.styleSheet() + f" QLineEdit {{ border: 1px solid {C.RED}; }}")
+            return
+        values = {
+            "wake_word_enabled": self._enabled,
+            "wake_phrase": self._phrase.text().strip() or "Hey Jarvis",
+            "picovoice_access_key": self._access_key.text().strip(),
+            "wake_word_model_path": self._model_path.text().strip(),
+            "wake_word_sensitivity": sensitivity,
+            "follow_up_timeout_seconds": timeout,
+            "wake_word_pre_roll_ms": 750,
+        }
+        self.saved.emit(values)
+        self.hide()
+
+
 class ClipboardPanel(QWidget):
     """Floating panel shown when text is copied — offers quick Jarvis actions."""
 
@@ -1905,6 +2068,7 @@ class MainWindow(QMainWindow):
     _cam_stream_sig = pyqtSignal(bool)       # True=start live stream, False=stop
     _cam_frame_sig  = pyqtSignal(bytes)      # live camera frame → HUD area
     _clipboard_sig  = pyqtSignal(str)        # clipboard text changed (thread-safe)
+    _wake_feedback_sig = pyqtSignal()           # activation chime on the Qt thread
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -1933,10 +2097,12 @@ class MainWindow(QMainWindow):
         self.on_text_command   = None
         self.on_remote_clicked = None   # callable: () -> (url, key) | None
         self.on_interrupt      = None   # callable: () -> None — stop JARVIS mid-speech
+        self.on_wake_settings_changed = None
         self._muted            = False
         self._current_file: str | None = None
         self._remote_overlay: RemoteKeyOverlay | None = None
         self._customize_overlay: CustomizeOverlay | None = None
+        self._wake_overlay: WakeWordOverlay | None = None
 
         central = QWidget()
         central.setStyleSheet(f"background: {C.BG};")
@@ -2046,6 +2212,7 @@ class MainWindow(QMainWindow):
         self._cam_stream_sig.connect(self._on_cam_stream)
         self._cam_frame_sig.connect(self._on_cam_frame)
         self._clipboard_sig.connect(self._show_clipboard_panel)
+        self._wake_feedback_sig.connect(QApplication.beep)
         self._cam_stop = threading.Event()
 
         # Camera preview overlay (child of central widget, positioned in resizeEvent)
@@ -2518,6 +2685,13 @@ class MainWindow(QMainWindow):
                 (cw.height() - oh) // 2,
                 ow, oh,
             )
+        if self._wake_overlay and self._wake_overlay.isVisible():
+            ow, oh = WakeWordOverlay._OW, min(WakeWordOverlay._OH, cw.height() - 16)
+            self._wake_overlay.setGeometry(
+                (cw.width() - ow) // 2,
+                (cw.height() - oh) // 2,
+                ow, oh,
+            )
         # Camera preview — bottom-right corner of the center/HUD area
         pw = _CameraPreview._W
         ph = self._cam_preview.height() or _CameraPreview._H
@@ -2872,6 +3046,14 @@ class MainWindow(QMainWindow):
         cust_btn.setStyleSheet(_BTN_STYLE_DIM)
         cust_btn.clicked.connect(self._open_customize)
         lay.addWidget(cust_btn)
+
+        wake_btn = QPushButton("🎙  WAKE WORD SETTINGS")
+        wake_btn.setFixedHeight(26)
+        wake_btn.setFont(QFont("Courier New", 7))
+        wake_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        wake_btn.setStyleSheet(_BTN_STYLE_DIM)
+        wake_btn.clicked.connect(self._open_wake_settings)
+        lay.addWidget(wake_btn)
 
         self._brief_btn = QPushButton()
         self._brief_btn.setFixedHeight(26)
@@ -3234,6 +3416,36 @@ class MainWindow(QMainWindow):
                 QPushButton:hover {{ color: {C.TEXT}; border: 1px solid {C.BORDER_B}; }}
             """)
 
+    # ── Wake-word settings ───────────────────────────────────────────────────────
+
+    def _open_wake_settings(self):
+        cfg = _read_full_config()
+        if self._wake_overlay:
+            self._wake_overlay.hide()
+        cw = self.centralWidget()
+        ov = WakeWordOverlay(cfg, parent=cw)
+        ow, oh = WakeWordOverlay._OW, min(WakeWordOverlay._OH, cw.height() - 16)
+        ov.setGeometry((cw.width() - ow) // 2, (cw.height() - oh) // 2, ow, oh)
+        ov.saved.connect(self._save_wake_settings)
+        ov.show()
+        ov.raise_()
+        self._wake_overlay = ov
+
+    def _save_wake_settings(self, values: dict):
+        try:
+            data = _read_full_config()
+            data.update(values)
+            API_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+            phrase = values.get("wake_phrase", "Hey Jarvis")
+            enabled = bool(values.get("wake_word_enabled", True))
+            self._log.append_log(
+                f'SYS: Wake word {"enabled" if enabled else "disabled"} — {phrase}.'
+            )
+            if self.on_wake_settings_changed:
+                threading.Thread(target=self.on_wake_settings_changed, daemon=True).start()
+        except Exception as exc:
+            self._log.append_log(f"ERR: Wake settings save failed — {exc}")
+
     # ── Customization ────────────────────────────────────────────────────────────
 
     def _open_customize(self):
@@ -3340,7 +3552,9 @@ class MainWindow(QMainWindow):
             self._apply_state("MUTED")
             self._log.append_log("SYS: Microphone muted.")
         else:
-            self._apply_state("LISTENING")
+            cfg = _read_full_config()
+            wake_ready = bool(cfg.get("wake_word_enabled", True) and cfg.get("picovoice_access_key"))
+            self._apply_state("STANDBY" if wake_ready else "LISTENING")
             self._log.append_log("SYS: Microphone active.")
 
     def _style_mute_btn(self):
@@ -3488,6 +3702,17 @@ class JarvisUI:
     @on_interrupt.setter
     def on_interrupt(self, cb):
         self._win.on_interrupt = cb
+
+    @property
+    def on_wake_settings_changed(self):
+        return self._win.on_wake_settings_changed
+
+    @on_wake_settings_changed.setter
+    def on_wake_settings_changed(self, cb):
+        self._win.on_wake_settings_changed = cb
+
+    def play_wake_feedback(self) -> None:
+        self._win._wake_feedback_sig.emit()
 
     def notify_phone_connected(self) -> None:
         self._win.notify_phone_connected()
