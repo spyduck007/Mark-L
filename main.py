@@ -1046,7 +1046,9 @@ class JarvisLive:
                 activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
                 turn_coverage=types.TurnCoverage.TURN_INCLUDES_ONLY_ACTIVITY,
             ),
-            explicit_vad_signal=True,
+            # Custom VAD only requires server-side automatic activity detection
+            # to be disabled. Older compatible google-genai releases do not
+            # expose the optional explicit_vad_signal setup field.
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
