@@ -106,12 +106,12 @@ python main.py
 
 ### "Hey Jarvis" wake word
 
-MARK L can keep computer-microphone audio local until the configured wake phrase is detected.
+MARK L can keep computer-microphone audio local until the configured wake phrase is detected. The detector uses the open-source `sherpa-onnx` keyword-spotting runtime and requires no account, API key, company email, or proprietary keyword file.
 
-1. Create a free Picovoice account and copy its AccessKey.
-2. Open MARK L's controls drawer and choose **Wake Word Settings**.
-3. Paste the AccessKey, leave the phrase as **Hey Jarvis**, and select **Save & Reload**.
-4. The first run creates and caches a platform-specific `.ppn` model under `config/wake_words/`. After that, wake-word inference runs locally.
+1. Open MARK L's controls drawer and choose **Wake Word Settings**.
+2. Leave the phrase as **Hey Jarvis** or enter another English phrase.
+3. Select **Save & Reload**.
+4. On first activation, MARK L downloads and caches the official compact sherpa-onnx keyword model under `config/wake_words/` (about 32 MB). Subsequent detection runs fully locally.
 
 While wake-word mode is armed, ordinary room audio is not forwarded to Gemini Live. Phone microphone and typed dashboard commands remain independent of the computer-microphone gate.
 

@@ -1593,10 +1593,10 @@ class CustomizeOverlay(QWidget):
 
 
 class WakeWordOverlay(QWidget):
-    """Wake-word configuration panel backed by api_keys.json."""
+    """Account-free local wake-word configuration panel."""
 
     saved = pyqtSignal(dict)
-    _OW, _OH = 440, 520
+    _OW, _OH = 440, 410
 
     def __init__(self, config: dict, parent=None):
         super().__init__(parent)
@@ -1633,7 +1633,7 @@ class WakeWordOverlay(QWidget):
 
         lay.addWidget(label("◉  WAKE WORD SETTINGS", 12, C.PRI, True))
         lay.addWidget(label(
-            "When enabled, room audio is processed locally by Porcupine and is not sent to Gemini until the wake phrase is detected.",
+            "Powered by sherpa-onnx. No account, company email, API key, or proprietary keyword file is required.",
             8, C.TEXT_MED,
         ))
 
@@ -1645,31 +1645,11 @@ class WakeWordOverlay(QWidget):
         lay.addWidget(self._enabled_btn)
         self._style_enabled()
 
-        lay.addWidget(label("WAKE PHRASE"))
+        lay.addWidget(label("WAKE PHRASE  (English words)"))
         self._phrase = QLineEdit(config.get("wake_phrase", "Hey Jarvis") or "Hey Jarvis")
+        self._phrase.setPlaceholderText("Hey Jarvis")
         self._phrase.setStyleSheet(field_style)
         lay.addWidget(self._phrase)
-
-        lay.addWidget(label("PICOVOICE ACCESS KEY"))
-        self._access_key = QLineEdit(config.get("picovoice_access_key", "") or "")
-        self._access_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self._access_key.setPlaceholderText("Paste the free AccessKey from Picovoice Console")
-        self._access_key.setStyleSheet(field_style)
-        lay.addWidget(self._access_key)
-
-        lay.addWidget(label("CUSTOM .PPN MODEL  (optional — auto-trained when blank)"))
-        model_row = QHBoxLayout(); model_row.setSpacing(5)
-        self._model_path = QLineEdit(config.get("wake_word_model_path", "") or "")
-        self._model_path.setPlaceholderText("Leave blank to create/cache Hey Jarvis automatically")
-        self._model_path.setStyleSheet(field_style)
-        model_row.addWidget(self._model_path)
-        browse = QPushButton("BROWSE")
-        browse.setFixedSize(68, 28)
-        browse.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
-        browse.setStyleSheet(f"color: {C.PRI}; border: 1px solid {C.BORDER_B}; background: transparent;")
-        browse.clicked.connect(self._browse_model)
-        model_row.addWidget(browse)
-        lay.addLayout(model_row)
 
         numbers = QHBoxLayout(); numbers.setSpacing(8)
         left = QVBoxLayout(); left.setSpacing(3)
@@ -1685,7 +1665,7 @@ class WakeWordOverlay(QWidget):
         lay.addLayout(numbers)
 
         lay.addWidget(label(
-            "The first automatic custom-model creation needs internet access. After the .ppn file is cached, detection runs locally.",
+            "On first activation MARK L downloads the official compact keyword model once (about 32 MB). Afterwards detection is fully local and room audio stays off Gemini until the phrase is heard.",
             7, C.ACC2,
         ))
         lay.addStretch()
@@ -1720,23 +1700,19 @@ class WakeWordOverlay(QWidget):
                 f"color: {C.ACC2}; background: #161000; border: 1px solid {C.ACC2}; border-radius: 3px;"
             )
 
-    def _browse_model(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select Porcupine keyword", "", "Porcupine Keyword (*.ppn)")
-        if path:
-            self._model_path.setText(path)
-
     def _save(self):
         try:
             sensitivity = max(0.0, min(1.0, float(self._sensitivity.text().strip() or "0.55")))
             timeout = max(2.0, min(60.0, float(self._timeout.text().strip() or "10")))
         except ValueError:
-            self._sensitivity.setStyleSheet(self._sensitivity.styleSheet() + f" QLineEdit {{ border: 1px solid {C.RED}; }}")
+            self._sensitivity.setStyleSheet(
+                self._sensitivity.styleSheet()
+                + f" QLineEdit {{ border: 1px solid {C.RED}; }}"
+            )
             return
         values = {
             "wake_word_enabled": self._enabled,
             "wake_phrase": self._phrase.text().strip() or "Hey Jarvis",
-            "picovoice_access_key": self._access_key.text().strip(),
-            "wake_word_model_path": self._model_path.text().strip(),
             "wake_word_sensitivity": sensitivity,
             "follow_up_timeout_seconds": timeout,
             "wake_word_pre_roll_ms": 750,
@@ -3435,6 +3411,10 @@ class MainWindow(QMainWindow):
         try:
             data = _read_full_config()
             data.update(values)
+            for legacy_key in (
+                "picovoice_access_key", "wake_word_model_path", "wake_word_language"
+            ):
+                data.pop(legacy_key, None)
             API_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
             phrase = values.get("wake_phrase", "Hey Jarvis")
             enabled = bool(values.get("wake_word_enabled", True))
@@ -3553,8 +3533,8 @@ class MainWindow(QMainWindow):
             self._log.append_log("SYS: Microphone muted.")
         else:
             cfg = _read_full_config()
-            wake_ready = bool(cfg.get("wake_word_enabled", True) and cfg.get("picovoice_access_key"))
-            self._apply_state("STANDBY" if wake_ready else "LISTENING")
+            wake_enabled = bool(cfg.get("wake_word_enabled", True))
+            self._apply_state("STANDBY" if wake_enabled else "LISTENING")
             self._log.append_log("SYS: Microphone active.")
 
     def _style_mute_btn(self):

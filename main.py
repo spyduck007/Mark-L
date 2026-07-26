@@ -596,7 +596,7 @@ class JarvisLive:
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
 
-        # Local wake-word gate. When Porcupine is configured, PC microphone
+        # Local wake-word gate. When sherpa-onnx is ready, PC microphone
         # audio reaches Gemini only while this gate is open.
         self._wake_settings = WakeWordSettings.load(API_CONFIG_PATH)
         self._wake_detector: WakeWordDetector | None = None
@@ -645,6 +645,7 @@ class JarvisLive:
                 return
 
             try:
+                self.ui.write_log("SYS: Initializing local sherpa-onnx wake detector...")
                 detector = await asyncio.to_thread(WakeWordDetector, settings)
                 if detector.sample_rate != SEND_SAMPLE_RATE:
                     detector.close()
@@ -652,12 +653,15 @@ class JarvisLive:
                         f"Wake model expects {detector.sample_rate} Hz; microphone uses {SEND_SAMPLE_RATE} Hz."
                     )
             except Exception as exc:
-                # Compatibility fallback: MARK L remains usable, but warns clearly
-                # that microphone privacy gating is not active yet.
-                self._wake_gate_open.set()
-                self.ui.set_state("LISTENING")
-                self.ui.write_log(f"WARN: Wake word unavailable — continuous listening active. {exc}")
-                print(f"[WakeWord] unavailable: {exc}")
+                # Fail closed: when wake-word mode is enabled but unavailable,
+                # computer-microphone audio must never fall through to Gemini.
+                self._wake_operational = True
+                self._wake_gate_open.clear()
+                self.ui.set_state("STANDBY")
+                self.ui.write_log(
+                    f"WARN: Wake word unavailable — PC microphone remains local and blocked. {exc}"
+                )
+                print(f"[WakeWord] unavailable (privacy gate closed): {exc}")
                 return
 
             self._wake_detector = detector
@@ -1096,7 +1100,7 @@ class JarvisLive:
                     loop.call_soon_threadsafe(self._queue_realtime_audio, data)
                 else:
                     self._wake_pre_roll.append(data)
-                    if self._wake_queue:
+                    if self._wake_queue and self._wake_detector is not None:
                         def _put_wake():
                             try:
                                 self._wake_queue.put_nowait(data)
