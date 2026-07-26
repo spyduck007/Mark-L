@@ -1462,6 +1462,11 @@ class JarvisLive:
                 event = await asyncio.to_thread(
                     self._voice_engine.process_microphone, raw, playback_active
                 )
+            except RuntimeError as exc:
+                if "cannot schedule new futures after shutdown" in str(exc):
+                    break
+                print(f"[VoiceEngine] process error: {exc}")
+                continue
             except Exception as exc:
                 print(f"[VoiceEngine] process error: {exc}")
                 continue
@@ -2070,6 +2075,11 @@ class JarvisLive:
                 event = await asyncio.to_thread(
                     self._voice_engine.process_microphone, chunk["data"], playback_active
                 )
+            except RuntimeError as exc:
+                if "cannot schedule new futures after shutdown" in str(exc):
+                    break
+                print(f"[Phone] Voice processing error: {exc}")
+                continue
             except Exception as exc:
                 print(f"[Phone] Voice processing error: {exc}")
                 continue

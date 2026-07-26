@@ -317,12 +317,13 @@ class VoiceAudioEngine:
                 if raw_samples.size else 0.0
             )
             correlation = 0.0
-            if (
-                playback_active
-                and self.conditioner_backend == "adaptive-fallback"
-                and self.conditioner
-            ):
-                clean, correlation = self.conditioner.process_capture(pcm_bytes)
+            if self.conditioner_backend == "adaptive-fallback" and self.conditioner:
+                if playback_active:
+                    clean, correlation = self.conditioner.process_capture(pcm_bytes)
+                else:
+                    # The fallback suppressor returns (audio, correlation), but
+                    # there is no echo to remove while JARVIS is silent.
+                    clean = pcm_bytes
             else:
                 clean = self.conditioner.process_capture(pcm_bytes) if self.conditioner else pcm_bytes
                 if playback_active and raw_samples.size:
