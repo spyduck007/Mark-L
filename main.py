@@ -29,6 +29,7 @@ import sounddevice as sd
 from google import genai
 from google.genai import types
 from ui import JarvisUI
+from core.model_config import HELPER_MODEL
 from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt,
     save_session_summary, pop_last_session,
@@ -1236,7 +1237,7 @@ class JarvisLive:
             client = _genai.Client(api_key=_get_api_key())
             resp   = await asyncio.to_thread(
                 client.models.generate_content,
-                model="gemini-2.5-flash",
+                model=HELPER_MODEL,
                 contents=prompt,
             )
             summary = (resp.text or "").strip()

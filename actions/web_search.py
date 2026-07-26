@@ -1,7 +1,10 @@
-#web_search.py
+# web_search.py
 import json
 import sys
 from pathlib import Path
+
+from core.model_config import HELPER_MODEL
+
 
 def _get_base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -9,7 +12,7 @@ def _get_base_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-BASE_DIR        = _get_base_dir()
+BASE_DIR = _get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 
 
@@ -18,279 +21,257 @@ def _get_api_key() -> str:
         return json.load(f)["gemini_api_key"]
 
 
-def _gemini_search(query: str) -> str:
-    from google import genai
-
-    client   = genai.Client(api_key=_get_api_key())
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=query,
-        config={"tools": [{"google_search": {}}]},
-    )
-
-    text = ""
-    for part in response.candidates[0].content.parts:
-        if hasattr(part, "text") and part.text:
-            text += part.text
-
-    text = text.strip()
-    if not text:
-        raise ValueError("Gemini returned an empty response.")
-    return text
+def _response_text(response) -> str:
+    """Extract only ordinary text parts, avoiding SDK thought-part warnings."""
+    chunks: list[str] = []
+    for candidate in getattr(response, "candidates", []) or []:
+        content = getattr(candidate, "content", None)
+        for part in getattr(content, "parts", []) or []:
+            text = getattr(part, "text", None)
+            if text:
+                chunks.append(text)
+    return "".join(chunks).strip()
 
 
-def _ddg_search(query: str, max_results: int = 6) -> list[dict]:
-    try:
-        from ddgs import DDGS
-    except ImportError:
-        from duckduckgo_search import DDGS
+def _ddg_text(query: str, max_results: int = 8) -> list[dict]:
+    from ddgs import DDGS
 
     results = []
-    with DDGS() as ddgs:
-        for r in ddgs.text(query, max_results=max_results):
+    with DDGS(timeout=8) as ddgs:
+        for item in ddgs.text(query, max_results=max_results):
             results.append({
-                "title":   r.get("title",  ""),
-                "snippet": r.get("body",   ""),
-                "url":     r.get("href",   ""),
+                "title": item.get("title", ""),
+                "snippet": item.get("body", ""),
+                "url": item.get("href", ""),
+                "source": item.get("source", ""),
             })
     return results
 
 
 def _ddg_news(query: str, max_results: int = 8) -> list[dict]:
-    """DDG news search — returns actual articles, not website homepages."""
-    try:
-        from ddgs import DDGS
-    except ImportError:
-        from duckduckgo_search import DDGS
+    """Retrieve news with DDGS, falling back to ordinary metasearch."""
+    from ddgs import DDGS
 
-    results = []
     try:
-        with DDGS() as ddgs:
-            for r in ddgs.news(query, max_results=max_results):
+        results = []
+        with DDGS(timeout=8) as ddgs:
+            for item in ddgs.news(query, max_results=max_results):
                 results.append({
-                    "title":   r.get("title",  ""),
-                    "snippet": r.get("body",   ""),
-                    "url":     r.get("url",    ""),
-                    "source":  r.get("source", ""),
+                    "title": item.get("title", ""),
+                    "snippet": item.get("body", ""),
+                    "url": item.get("url", ""),
+                    "source": item.get("source", ""),
+                    "date": item.get("date", ""),
                 })
-    except Exception as e:
-        print(f"[WebSearch] ⚠️ DDG news() failed ({e}) — falling back to text search")
-        results = _ddg_search(query, max_results=max_results)
-    return results
+        if results:
+            return results
+    except Exception as exc:
+        print(f"[WebSearch] DDGS news failed ({exc}) - falling back to text search")
+
+    return _ddg_text(f"latest news {query}".strip(), max_results=max_results)
 
 
-def _format_ddg(query: str, results: list[dict]) -> str:
+def _format_results(query: str, results: list[dict], heading: str = "Search results") -> str:
     if not results:
         return f"No results found for: {query}"
 
-    lines = [f"Search results for: {query}\n"]
-    for i, r in enumerate(results, 1):
-        if r.get("title"):   lines.append(f"{i}. {r['title']}")
-        if r.get("snippet"): lines.append(f"   {r['snippet']}")
-        if r.get("url"):     lines.append(f"   Source: {r['url']}")
+    lines = [f"{heading} for: {query}", ""]
+    for index, item in enumerate(results, 1):
+        title = item.get("title", "").strip()
+        snippet = item.get("snippet", "").strip()
+        url = item.get("url", "").strip()
+        source = item.get("source", "").strip()
+        date = item.get("date", "").strip()
+
+        label = title or url or f"Result {index}"
+        metadata = " | ".join(value for value in (source, date) if value)
+        lines.append(f"{index}. {label}" + (f" [{metadata}]" if metadata else ""))
+        if snippet:
+            lines.append(f"   {snippet}")
+        if url:
+            lines.append(f"   Source: {url}")
         lines.append("")
     return "\n".join(lines).strip()
 
 
-def _format_news(query: str, results: list[dict]) -> str:
+def _source_packet(results: list[dict]) -> str:
+    blocks = []
+    for index, item in enumerate(results, 1):
+        blocks.append(
+            "\n".join([
+                f"SOURCE {index}",
+                f"Title: {item.get('title', '')}",
+                f"Publisher: {item.get('source', '')}",
+                f"Date: {item.get('date', '')}",
+                f"Snippet: {item.get('snippet', '')}",
+                f"URL: {item.get('url', '')}",
+            ])
+        )
+    return "\n\n".join(blocks)
+
+
+def _synthesize(query: str, results: list[dict], instruction: str) -> str:
+    """Use Flash-Lite only to synthesize already-retrieved free search results."""
     if not results:
-        return f"No news found for: {query}"
+        return f"No results found for: {query}"
 
-    lines = [f"Latest news: {query}\n"]
-    for i, r in enumerate(results, 1):
-        title = r.get("title", "")
-        if not title:
-            continue
-        src = f"  [{r['source']}]" if r.get("source") else ""
-        lines.append(f"{i}. {title}{src}")
-        if r.get("snippet"):
-            lines.append(f"   {r['snippet'][:140]}")
-        if r.get("url"):
-            lines.append(f"   {r['url']}")
-        lines.append("")
-    return "\n".join(lines).strip()
-
-
-# ── Briefing helper ────────────────────────────────────────────────────────────
-
-def _gemini_headlines(n: int = 5) -> tuple[list[str], str]:
-    """
-    Fetches current headlines via Gemini grounded search.
-    Optimised for speed: minimal prompt + strict token cap.
-    Returns (headline_list, raw_text_for_display).
-    """
-    import re
     from google import genai
+
+    prompt = f"""You are summarizing web search results for a desktop assistant.
+
+User request:
+{query}
+
+Task:
+{instruction}
+
+Rules:
+- Use only the supplied sources.
+- Do not invent facts that are absent from the supplied sources.
+- Preserve useful dates, prices, names, and qualifications.
+- Cite claims inline as [1], [2], etc. using the source numbers below.
+- End with a compact Sources section containing the source title and URL.
+- Be direct and useful rather than discussing the search process.
+
+SOURCES:
+{_source_packet(results)}
+"""
 
     client = genai.Client(api_key=_get_api_key())
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=f"Current world news: {n} headlines. Numbered list, titles only.",
-        config={"tools": [{"google_search": {}}]},
+        model=HELPER_MODEL,
+        contents=prompt,
     )
+    text = _response_text(response)
+    if not text:
+        raise ValueError("Gemini returned an empty synthesis response.")
+    return text
 
-    raw = ""
-    for part in response.candidates[0].content.parts:
-        if hasattr(part, "text") and part.text:
-            raw += part.text
-
-    headlines = []
-    for line in raw.strip().split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        # Only accept lines that begin with a number — skips preamble/closing sentences
-        if not re.match(r'^[\d]+[.\)\-]', line):
-            continue
-        clean = re.sub(r'^[\d]+[.\)\-]\s*', '', line)
-        clean = re.sub(r'^\*+\s*',          '', clean).strip()
-        if clean and len(clean) > 10:
-            headlines.append(clean)
-
-    return headlines[:n], raw.strip()
-
-
-# ── Modes ──────────────────────────────────────────────────────────────────────
 
 def _search(query: str) -> str:
-    """Default search — Gemini grounded, DDG fallback."""
+    results = _ddg_text(query, max_results=8)
     try:
-        return _gemini_search(query)
-    except Exception as e:
-        print(f"[WebSearch] ⚠️ Gemini failed ({e}) — trying DDG...")
-        results = _ddg_search(query)
-        return _format_ddg(query, results)
+        return _synthesize(
+            query,
+            results,
+            "Answer the request accurately and concisely from the strongest available results.",
+        )
+    except Exception as exc:
+        print(f"[WebSearch] Gemini synthesis failed ({exc}) - returning raw results")
+        return _format_results(query, results)
 
 
 def _news(query: str) -> str:
-    """
-    Runs Gemini grounded search AND DDG news in parallel.
-    Returns whichever delivers a valid result first; cancels the other.
-    """
-    import threading
-
-    gemini_query = f"latest news today: {query}" if query else "top world news today"
-    ddg_query    = query if query else "world news today"
-
-    result_box  = [None]   # first valid result lands here
-    lock        = threading.Lock()
-    done_evt    = threading.Event()
-    failures    = [0]
-
-    def _store(r: str) -> None:
-        if r and len(r) > 60:
-            with lock:
-                if result_box[0] is None:
-                    result_box[0] = r
-            done_evt.set()
-        else:
-            with lock:
-                failures[0] += 1
-                if failures[0] >= 2:   # both failed — unblock caller
-                    done_evt.set()
-
-    def _try_gemini():
-        try:
-            _store(_gemini_search(gemini_query))
-        except Exception as e:
-            print(f"[WebSearch] ⚠️ Gemini news failed ({e})")
-            _store("")
-
-    def _try_ddg():
-        try:
-            results = _ddg_news(ddg_query, max_results=8)
-            _store(_format_news(ddg_query, results))
-        except Exception as e:
-            print(f"[WebSearch] ⚠️ DDG news failed ({e})")
-            _store("")
-
-    threading.Thread(target=_try_gemini, daemon=True).start()
-    threading.Thread(target=_try_ddg,    daemon=True).start()
-
-    done_evt.wait(timeout=10.0)
-    return result_box[0] or f"No news found for: {query}"
+    topic = query or "top world news today"
+    results = _ddg_news(topic, max_results=10)
+    try:
+        return _synthesize(
+            topic,
+            results,
+            "Summarize the latest significant developments. Prioritize explicit publication dates and avoid presenting undated items as breaking news.",
+        )
+    except Exception as exc:
+        print(f"[WebSearch] Gemini news synthesis failed ({exc}) - returning raw results")
+        return _format_results(topic, results, heading="Latest news")
 
 
 def _research(query: str) -> str:
-    """
-    Deep dive — asks Gemini for a comprehensive answer with context.
-    Falls back to a wider DDG fetch.
-    """
-    research_query = (
-        f"Comprehensive, detailed explanation of: {query}. "
-        "Include background context, key facts, current state, and important nuances."
-    )
+    results = _ddg_text(query, max_results=12)
     try:
-        return _gemini_search(research_query)
-    except Exception as e:
-        print(f"[WebSearch] ⚠️ Research Gemini failed ({e}) — DDG fallback...")
-        results = _ddg_search(query, max_results=10)
-        return _format_ddg(query, results)
+        return _synthesize(
+            query,
+            results,
+            "Provide a thorough explanation with background, key facts, current state, disagreements, and important caveats.",
+        )
+    except Exception as exc:
+        print(f"[WebSearch] Gemini research synthesis failed ({exc}) - returning raw results")
+        return _format_results(query, results, heading="Research sources")
 
 
 def _price(query: str) -> str:
-    """Product price lookup — searches for current market prices."""
-    price_query = f"current price of {query} — how much does it cost today"
+    search_query = f"current price of {query}"
+    results = _ddg_text(search_query, max_results=8)
     try:
-        return _gemini_search(price_query)
-    except Exception as e:
-        print(f"[WebSearch] ⚠️ Price Gemini failed ({e}) — DDG fallback...")
-        results = _ddg_search(f"{query} price buy", max_results=6)
-        return _format_ddg(query, results)
+        return _synthesize(
+            query,
+            results,
+            "Report current prices or price ranges, including retailer, configuration, region, and date where available. Do not merge incompatible variants into one price.",
+        )
+    except Exception as exc:
+        print(f"[WebSearch] Gemini price synthesis failed ({exc}) - returning raw results")
+        return _format_results(search_query, results, heading="Price results")
 
 
 def _compare(items: list[str], aspect: str) -> str:
-    query = (
-        f"Compare {', '.join(items)} in terms of {aspect}. "
-        "Give specific facts and data."
-    )
-    try:
-        return _gemini_search(query)
-    except Exception as e:
-        print(f"[WebSearch] ⚠️ Gemini compare failed: {e} — falling back to DDG")
-
-    all_results: dict[str, list] = {}
+    query = f"Compare {', '.join(items)} for {aspect}"
+    results: list[dict] = []
     for item in items:
         try:
-            all_results[item] = _ddg_search(f"{item} {aspect}", max_results=3)
-        except Exception:
-            all_results[item] = []
+            results.extend(_ddg_text(f"{item} {aspect}", max_results=4))
+        except Exception as exc:
+            print(f"[WebSearch] Search failed for {item!r}: {exc}")
 
-    lines = [f"Comparison — {aspect.upper()}", "─" * 40]
-    for item in items:
-        lines.append(f"\n▸ {item}")
-        for r in all_results.get(item, [])[:2]:
-            if r.get("snippet"):
-                lines.append(f"  • {r['snippet']}")
-            if r.get("url"):
-                lines.append(f"    {r['url']}")
-    return "\n".join(lines)
+    try:
+        return _synthesize(
+            query,
+            results,
+            f"Compare the requested items specifically on {aspect}. Clearly separate verified differences from missing information.",
+        )
+    except Exception as exc:
+        print(f"[WebSearch] Gemini comparison synthesis failed ({exc}) - returning raw results")
+        return _format_results(query, results, heading="Comparison sources")
 
 
-# ── Public entry point ─────────────────────────────────────────────────────────
+def _gemini_headlines(n: int = 5) -> tuple[list[str], str]:
+    """Compatibility helper for the startup briefing."""
+    import re
+
+    results = _ddg_news("top world news today", max_results=max(n + 3, 8))
+    try:
+        raw = _synthesize(
+            "top world news today",
+            results,
+            f"Return exactly {n} major current headlines as a numbered list. Put only the headline on each numbered line, followed by a Sources section.",
+        )
+    except Exception as exc:
+        print(f"[WebSearch] Gemini headline synthesis failed ({exc})")
+        raw = _format_results("top world news today", results, heading="Latest news")
+
+    headlines = []
+    for line in raw.splitlines():
+        match = re.match(r"^\s*\d+[.)-]\s*(.+?)\s*$", line)
+        if not match:
+            continue
+        headline = re.sub(r"\s*\[\d+(?:,\s*\d+)*\]\s*$", "", match.group(1)).strip()
+        if len(headline) > 10:
+            headlines.append(headline)
+        if len(headlines) >= n:
+            break
+    return headlines, raw.strip()
+
 
 def web_search(
-    parameters:     dict,
+    parameters: dict,
     response=None,
     player=None,
     session_memory=None,
 ) -> str:
     params = parameters or {}
-    query  = params.get("query", "").strip()
-    mode   = params.get("mode",  "search").lower().strip()
-    items  = params.get("items", [])
+    query = params.get("query", "").strip()
+    mode = params.get("mode", "search").lower().strip()
+    items = params.get("items", [])
     aspect = params.get("aspect", "general").strip() or "general"
 
     if not query and not items:
         return "Please provide a search query."
 
-    if items and mode not in ("compare",):
+    if items and mode != "compare":
         mode = "compare"
 
     if player:
         player.write_log(f"[Search:{mode}] {query or ', '.join(items)}")
 
-    print(f"[WebSearch] 🔍 mode={mode!r}  query={query!r}")
+    print(f"[WebSearch] mode={mode!r} query={query!r}")
 
     try:
         if mode == "compare" and items:
@@ -302,7 +283,6 @@ def web_search(
         if mode == "price":
             return _price(query)
         return _search(query)
-
-    except Exception as e:
-        print(f"[WebSearch] ❌ All backends failed: {e}")
-        return f"Search failed: {e}"
+    except Exception as exc:
+        print(f"[WebSearch] All search backends failed: {exc}")
+        return f"Search failed: {exc}"

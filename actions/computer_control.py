@@ -14,6 +14,7 @@ else:
 import time
 import random
 from pathlib import Path
+from core.model_config import HELPER_MODEL
 
 try:
     import pyautogui
@@ -336,7 +337,7 @@ def _screen_find(description: str) -> tuple[int, int] | None:
         )
 
         response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
+            model=HELPER_MODEL,
             contents=[
                 gtypes.Part.from_bytes(data=image_bytes, mime_type="image/png"),
                 prompt,

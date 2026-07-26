@@ -8,6 +8,7 @@ import tempfile
 import platform
 from pathlib import Path
 from datetime import datetime
+from core.model_config import HELPER_MODEL
 
 try:
     import pyautogui
@@ -142,7 +143,7 @@ Output ONLY the Python code. No explanation, no markdown, no backticks.
 Task: {task}"""
 
     try:
-        response = _client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        response = _client.models.generate_content(model=HELPER_MODEL, contents=prompt)
         code = response.text.strip()
         if code.startswith("```"):
             lines = code.split("\n")
