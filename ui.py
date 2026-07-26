@@ -338,100 +338,155 @@ class _SysMetrics:
 _metrics = _SysMetrics()
 
 class HudCanvas(QWidget):
+    """Animated, software-rendered 3D particle core.
+
+    The effect deliberately stays inside QPainter so it works on macOS Retina,
+    Windows, and Linux without requiring an OpenGL context or new dependency.
+    """
+
+    _SPHERE_COUNT = 560
+    _HALO_COUNT = 150
+    _STAR_COUNT = 90
+
     def __init__(self, face_path: str, assistant_name: str = "J.A.R.V.I.S", parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
         self.setMinimumSize(300, 300)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-        self.muted    = False
+        self.muted = False
         self.speaking = False
-        self.state    = "INITIALISING"
+        self.state = "INITIALISING"
         self._assistant_name = assistant_name
+        self._face_path = face_path  # retained for API compatibility
 
-        self._tick       = 0
-        self._scale      = 1.0
-        self._tgt_scale  = 1.0
-        self._halo       = 55.0
-        self._tgt_halo   = 55.0
-        self._last_t     = time.time()
-        self._scan       = 0.0
-        self._scan2      = 180.0
-        self._rings      = [0.0, 120.0, 240.0]
-        self._pulses: list[float] = [0.0, 50.0, 100.0]
-        self._blink      = True
+        self._tick = 0
+        self._time = 0.0
+        self._last_frame = time.perf_counter()
+        self._energy = 0.12
+        self._angle_x = -0.28
+        self._angle_y = 0.0
+        self._angle_z = 0.08
+        self._orbit_phase = 0.0
+        self._blink = True
         self._blink_tick = 0
-        self._particles: list[list[float]] = []
-        self._face_px: QPixmap | None = None
-        self._load_face(face_path)
+
+        rng = random.Random(0x4D41524B)  # deterministic MARK particle field
+        golden_angle = math.pi * (3.0 - math.sqrt(5.0))
+
+        # Fibonacci sphere: evenly distributed particles without visible latitude bands.
+        self._sphere_points: list[tuple[float, float, float, float, float]] = []
+        for i in range(self._SPHERE_COUNT):
+            y = 1.0 - 2.0 * (i + 0.5) / self._SPHERE_COUNT
+            ring = math.sqrt(max(0.0, 1.0 - y * y))
+            theta = golden_angle * i
+            x = math.cos(theta) * ring
+            z = math.sin(theta) * ring
+            self._sphere_points.append(
+                (x, y, z, rng.random() * math.tau, rng.uniform(0.72, 1.32))
+            )
+
+        # A sparse neural lattice across nearby Fibonacci points.
+        self._connections: list[tuple[int, int]] = []
+        for i in range(0, self._SPHERE_COUNT - 36, 2):
+            for offset in (21, 34):
+                j = i + offset
+                ax, ay, az, _, _ = self._sphere_points[i]
+                bx, by, bz, _, _ = self._sphere_points[j]
+                distance = math.sqrt((ax - bx) ** 2 + (ay - by) ** 2 + (az - bz) ** 2)
+                if distance < 0.34:
+                    self._connections.append((i, j))
+
+        # Loose toroidal particles make the core feel larger than a simple sphere.
+        self._halo_points: list[tuple[float, float, float, float, float]] = []
+        for _ in range(self._HALO_COUNT):
+            a = rng.random() * math.tau
+            b = rng.random() * math.tau
+            major = rng.uniform(1.24, 1.48)
+            minor = rng.uniform(0.035, 0.14)
+            self._halo_points.append((
+                (major + minor * math.cos(b)) * math.cos(a),
+                minor * math.sin(b),
+                (major + minor * math.cos(b)) * math.sin(a),
+                rng.random() * math.tau,
+                rng.uniform(0.55, 1.15),
+            ))
+
+        # A distant depth field prevents the center from looking pasted onto a flat panel.
+        self._stars: list[tuple[float, float, float, float]] = []
+        for _ in range(self._STAR_COUNT):
+            while True:
+                x = rng.uniform(-1.9, 1.9)
+                y = rng.uniform(-1.55, 1.55)
+                z = rng.uniform(-1.7, 1.7)
+                if x * x + y * y > 1.2:
+                    break
+            self._stars.append((x, y, z, rng.uniform(0.4, 1.25)))
 
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
         self._tmr.start(16)
 
-    def _load_face(self, path: str):
-        try:
-            from PIL import Image, ImageDraw
-            import io
-            img = Image.open(path).convert("RGBA")
-            sz  = min(img.size)
-            img = img.resize((sz, sz), Image.LANCZOS)
-            mk  = Image.new("L", (sz, sz), 0)
-            ImageDraw.Draw(mk).ellipse((2, 2, sz - 2, sz - 2), fill=255)
-            img.putalpha(mk)
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            px = QPixmap(); px.loadFromData(buf.getvalue())
-            self._face_px = px
-        except Exception:
-            self._face_px = None
+    @staticmethod
+    def _rotate_point(
+        x: float, y: float, z: float,
+        angle_x: float, angle_y: float, angle_z: float,
+    ) -> tuple[float, float, float]:
+        cos_y, sin_y = math.cos(angle_y), math.sin(angle_y)
+        x, z = x * cos_y + z * sin_y, -x * sin_y + z * cos_y
+
+        cos_x, sin_x = math.cos(angle_x), math.sin(angle_x)
+        y, z = y * cos_x - z * sin_x, y * sin_x + z * cos_x
+
+        cos_z, sin_z = math.cos(angle_z), math.sin(angle_z)
+        return x * cos_z - y * sin_z, x * sin_z + y * cos_z, z
+
+    @staticmethod
+    def _project_point(
+        x: float, y: float, z: float,
+        cx: float, cy: float, radius: float,
+    ) -> tuple[float, float, float]:
+        camera = 4.2
+        perspective = 3.2 / max(1.8, camera - z)
+        return cx + x * radius * perspective, cy + y * radius * perspective, z
+
+    def _state_energy_target(self) -> float:
+        if self.muted or self.state == "MUTED":
+            return 0.025
+        if self.speaking or self.state == "SPEAKING":
+            return 0.93
+        if self.state == "PROCESSING":
+            return 0.68
+        if self.state == "THINKING":
+            return 0.56
+        if self.state == "LISTENING":
+            return 0.24
+        return 0.12
 
     def _step(self):
+        now = time.perf_counter()
+        dt = min(0.05, max(0.001, now - self._last_frame))
+        self._last_frame = now
         self._tick += 1
-        now = time.time()
-        if now - self._last_t > (0.12 if self.speaking else 0.5):
-            if self.speaking:
-                self._tgt_scale = random.uniform(1.06, 1.14)
-                self._tgt_halo  = random.uniform(145, 190)
-            elif self.muted:
-                self._tgt_scale = random.uniform(0.998, 1.002)
-                self._tgt_halo  = random.uniform(15, 28)
-            else:
-                self._tgt_scale = random.uniform(1.001, 1.008)
-                self._tgt_halo  = random.uniform(48, 68)
-            self._last_t = now
+        self._time += dt
 
-        sp = 0.38 if self.speaking else 0.15
-        self._scale += (self._tgt_scale - self._scale) * sp
-        self._halo  += (self._tgt_halo  - self._halo)  * sp
+        target = self._state_energy_target()
+        response = 1.0 - math.exp(-dt * (8.5 if target > self._energy else 4.5))
+        self._energy += (target - self._energy) * response
 
-        speeds = [1.3, -0.9, 2.0] if self.speaking else [0.55, -0.35, 0.9]
-        for i, spd in enumerate(speeds):
-            self._rings[i] = (self._rings[i] + spd) % 360
+        if self.muted:
+            speed = 0.13
+        elif self.speaking:
+            speed = 0.82
+        elif self.state in ("THINKING", "PROCESSING"):
+            speed = 0.52
+        else:
+            speed = 0.28
 
-        self._scan  = (self._scan  + (3.0 if self.speaking else 1.3)) % 360
-        self._scan2 = (self._scan2 + (-2.0 if self.speaking else -0.75)) % 360
-
-        fw  = min(self.width(), self.height())
-        lim = fw * 0.74
-        spd = 4.2 if self.speaking else 2.0
-        self._pulses = [r + spd for r in self._pulses if r + spd < lim]
-        if len(self._pulses) < 3 and random.random() < (0.07 if self.speaking else 0.025):
-            self._pulses.append(0.0)
-
-        if self.speaking and random.random() < 0.28:
-            cx, cy = self.width() / 2, self.height() / 2
-            ang = random.uniform(0, 2 * math.pi)
-            r_s = fw * 0.28
-            self._particles.append([
-                cx + math.cos(ang) * r_s, cy + math.sin(ang) * r_s,
-                math.cos(ang) * random.uniform(0.9, 2.4),
-                math.sin(ang) * random.uniform(0.9, 2.4) - 0.4, 1.0,
-            ])
-        self._particles = [
-            [p[0]+p[2], p[1]+p[3], p[2]*0.97, p[3]*0.97, p[4]-0.028]
-            for p in self._particles if p[4] > 0
-        ]
+        self._angle_y = (self._angle_y + dt * speed) % math.tau
+        self._angle_x = -0.28 + math.sin(self._time * 0.37) * 0.13
+        self._angle_z = 0.08 + math.sin(self._time * 0.23) * 0.08
+        self._orbit_phase = (self._orbit_phase + dt * (0.7 + speed * 1.35)) % math.tau
 
         self._blink_tick += 1
         if self._blink_tick >= 38:
@@ -439,162 +494,277 @@ class HudCanvas(QWidget):
             self._blink_tick = 0
         self.update()
 
+    def _active_colors(self) -> tuple[str, str]:
+        if self.muted or self.state == "MUTED":
+            return C.MUTED_C, C.RED
+        if self.speaking or self.state == "SPEAKING":
+            return C.PRI, C.ACC
+        if self.state in ("THINKING", "PROCESSING"):
+            return C.PRI, C.ACC2
+        if self.state == "LISTENING":
+            return C.PRI, C.GREEN
+        return C.PRI, C.WHITE
+
+    def _orbit_xyz(self, ring: int, angle: float) -> tuple[float, float, float]:
+        radius = (1.31, 1.42, 1.53)[ring]
+        x = math.cos(angle) * radius
+        y = math.sin(angle * (2.0 + ring * 0.5) + ring) * (0.035 + ring * 0.012)
+        z = math.sin(angle) * radius
+        fixed_rotations = (
+            (0.58, 0.12, 0.20),
+            (-0.76, 0.30, 0.88),
+            (1.03, -0.24, -0.66),
+        )
+        fx, fy, fz = fixed_rotations[ring]
+        x, y, z = self._rotate_point(x, y, z, fx, fy, fz)
+        return self._rotate_point(
+            x, y, z,
+            self._angle_x * 0.55,
+            self._angle_y * (0.72 + ring * 0.08),
+            self._angle_z,
+        )
+
+    def _paint_depth_field(
+        self, p: QPainter, cx: float, cy: float, radius: float, base_hex: str,
+    ) -> None:
+        for x, y, z, size in self._stars:
+            rx, ry, rz = self._rotate_point(
+                x, y, z,
+                self._angle_x * 0.18,
+                self._angle_y * 0.11,
+                self._angle_z * 0.12,
+            )
+            sx, sy, depth = self._project_point(rx, ry, rz, cx, cy, radius)
+            alpha = int(20 + 34 * ((depth + 1.7) / 3.4))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(qcol(base_hex, max(8, min(62, alpha)))))
+            dot = size * (0.8 + max(0.0, depth) * 0.25)
+            p.drawEllipse(QPointF(sx, sy), dot, dot)
+
+    def _paint_orbits(
+        self, p: QPainter, cx: float, cy: float, radius: float,
+        base_hex: str, accent_hex: str,
+    ) -> None:
+        segments = 92
+        for ring in range(3):
+            projected: list[tuple[float, float, float]] = []
+            for i in range(segments + 1):
+                angle = math.tau * i / segments
+                x, y, z = self._orbit_xyz(ring, angle)
+                projected.append(self._project_point(x, y, z, cx, cy, radius))
+
+            for i in range(segments):
+                x1, y1, z1 = projected[i]
+                x2, y2, z2 = projected[i + 1]
+                depth = ((z1 + z2) * 0.5 + 1.6) / 3.2
+                alpha = int((18 + 54 * depth) * (0.52 + self._energy * 0.65))
+                color = accent_hex if ring == 1 else base_hex
+                p.setPen(QPen(qcol(color, max(8, min(92, alpha))), 0.75 + ring * 0.16))
+                p.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+
+            for i in range(ring * 3, segments, 11):
+                sx, sy, z = projected[i]
+                depth = max(0.0, min(1.0, (z + 1.6) / 3.2))
+                dot = 0.8 + depth * 1.2
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(qcol(accent_hex, int(40 + 100 * depth))))
+                p.drawEllipse(QPointF(sx, sy), dot, dot)
+
+    def _paint_halo_particles(
+        self, p: QPainter, cx: float, cy: float, radius: float,
+        base_hex: str, accent_hex: str,
+    ) -> None:
+        points: list[tuple[float, float, float, float, float]] = []
+        for x, y, z, phase, size in self._halo_points:
+            wobble = 1.0 + 0.025 * math.sin(self._time * 1.7 + phase)
+            rx, ry, rz = self._rotate_point(
+                x * wobble, y * wobble, z * wobble,
+                0.67 + self._angle_x * 0.45,
+                self._angle_y * 0.54 + self._time * 0.08,
+                -0.34 + self._angle_z,
+            )
+            sx, sy, depth = self._project_point(rx, ry, rz, cx, cy, radius)
+            points.append((depth, sx, sy, phase, size))
+
+        for depth, sx, sy, phase, size in sorted(points):
+            d = max(0.0, min(1.0, (depth + 1.7) / 3.4))
+            alpha = int((18 + d * 92) * (0.55 + self._energy * 0.5))
+            color = accent_hex if math.sin(phase * 2.3) > 0.72 else base_hex
+            dot = size * (0.65 + d * 0.95)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(qcol(color, max(8, min(126, alpha)))))
+            p.drawEllipse(QPointF(sx, sy), dot, dot)
+
+    def _paint_particle_sphere(
+        self, p: QPainter, cx: float, cy: float, radius: float,
+        base_hex: str, accent_hex: str,
+    ) -> None:
+        projected: list[tuple[float, float, float, float, float]] = []
+        speaking_wave = 1.0 if self.speaking else 0.0
+
+        for x, y, z, phase, size in self._sphere_points:
+            breathe = 1.0 + 0.012 * math.sin(self._time * 1.9 + phase)
+            energy_wave = self._energy * 0.052 * (
+                0.45 + 0.55 * math.sin(self._time * 5.4 + phase + y * 3.0)
+            )
+            voice_ripple = speaking_wave * 0.025 * math.sin(
+                self._time * 10.0 + y * 11.0 + phase
+            )
+            scale = breathe + energy_wave + voice_ripple
+            rx, ry, rz = self._rotate_point(
+                x * scale, y * scale, z * scale,
+                self._angle_x, self._angle_y, self._angle_z,
+            )
+            sx, sy, depth = self._project_point(rx, ry, rz, cx, cy, radius)
+            projected.append((depth, sx, sy, phase, size))
+
+        # Neural links sit behind the particles, creating a dimensional mesh.
+        for index, (a, b) in enumerate(self._connections):
+            za, xa, ya, _, _ = projected[a]
+            zb, xb, yb, _, _ = projected[b]
+            avg_depth = (za + zb) * 0.5
+            d = max(0.0, min(1.0, (avg_depth + 1.0) * 0.5))
+            if d < 0.16:
+                continue
+            alpha = int((10 + 58 * d) * (0.55 + self._energy * 0.82))
+            color = accent_hex if index % 9 == 0 else base_hex
+            p.setPen(QPen(qcol(color, max(7, min(84, alpha))), 0.55 + d * 0.35))
+            p.drawLine(QPointF(xa, ya), QPointF(xb, yb))
+
+        for depth, sx, sy, phase, size in sorted(projected):
+            d = max(0.0, min(1.0, (depth + 1.0) * 0.5))
+            front = d ** 1.35
+            color = accent_hex if math.sin(phase * 1.91 + self._time * 0.4) > 0.82 else base_hex
+            alpha = int((35 + front * 205) * (0.62 + self._energy * 0.38))
+            dot = size * (0.8 + front * 2.15) * (1.0 + self._energy * 0.22)
+
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(qcol(color, max(10, min(92, alpha // 3)))))
+            p.drawEllipse(QPointF(sx, sy), dot * 2.4, dot * 2.4)
+
+            p.setBrush(QBrush(qcol(color, max(22, min(255, alpha)))))
+            p.drawEllipse(QPointF(sx, sy), dot, dot)
+
+            if front > 0.77 and size > 1.02:
+                p.setBrush(QBrush(qcol(C.WHITE, int(80 + front * 145))))
+                p.drawEllipse(QPointF(sx, sy), dot * 0.35, dot * 0.35)
+
+    def _paint_comets(
+        self, p: QPainter, cx: float, cy: float, radius: float,
+        accent_hex: str,
+    ) -> None:
+        for ring, offset in enumerate((0.2, 2.35, 4.6)):
+            head = self._orbit_phase * (1.0 + ring * 0.11) + offset
+            trail: list[tuple[float, float, float, float]] = []
+            for j in range(15):
+                angle = head - j * (0.026 + ring * 0.004)
+                x, y, z = self._orbit_xyz(ring, angle)
+                sx, sy, depth = self._project_point(x, y, z, cx, cy, radius)
+                trail.append((sx, sy, depth, 1.0 - j / 15.0))
+
+            for j in range(len(trail) - 1, 0, -1):
+                x1, y1, z1, fade1 = trail[j]
+                x2, y2, z2, fade2 = trail[j - 1]
+                depth = max(0.15, min(1.0, ((z1 + z2) * 0.5 + 1.6) / 3.2))
+                alpha = int(145 * fade1 * depth * (0.45 + self._energy * 0.65))
+                p.setPen(QPen(qcol(accent_hex, max(8, min(150, alpha))), 0.8 + fade2 * 1.4))
+                p.drawLine(QPointF(x1, y1), QPointF(x2, y2))
+
+            hx, hy, hz, _ = trail[0]
+            depth = max(0.2, min(1.0, (hz + 1.6) / 3.2))
+            head_size = 2.0 + 2.8 * depth + self._energy * 1.7
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(qcol(accent_hex, 65)))
+            p.drawEllipse(QPointF(hx, hy), head_size * 2.4, head_size * 2.4)
+            p.setBrush(QBrush(qcol(C.WHITE, 235)))
+            p.drawEllipse(QPointF(hx, hy), head_size * 0.55, head_size * 0.55)
+
+    def _paint_core_glow(
+        self, p: QPainter, cx: float, cy: float, radius: float,
+        base_hex: str, accent_hex: str,
+    ) -> None:
+        glow_radius = radius * (0.61 + self._energy * 0.08)
+        gradient = QRadialGradient(QPointF(cx, cy), glow_radius)
+        gradient.setColorAt(0.0, qcol(accent_hex, int(38 + self._energy * 46)))
+        gradient.setColorAt(0.28, qcol(base_hex, int(24 + self._energy * 34)))
+        gradient.setColorAt(0.72, qcol(base_hex, 8))
+        gradient.setColorAt(1.0, qcol(C.BG, 0))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(gradient))
+        p.drawEllipse(QRectF(
+            cx - glow_radius, cy - glow_radius,
+            glow_radius * 2.0, glow_radius * 2.0,
+        ))
+
+        nucleus = 7.0 + self._energy * 7.0 + math.sin(self._time * 4.0) * 1.2
+        nucleus_gradient = QRadialGradient(QPointF(cx, cy), nucleus * 2.6)
+        nucleus_gradient.setColorAt(0.0, qcol(C.WHITE, 245))
+        nucleus_gradient.setColorAt(0.18, qcol(accent_hex, 220))
+        nucleus_gradient.setColorAt(0.54, qcol(base_hex, 82))
+        nucleus_gradient.setColorAt(1.0, qcol(base_hex, 0))
+        p.setBrush(QBrush(nucleus_gradient))
+        p.drawEllipse(QPointF(cx, cy), nucleus * 2.6, nucleus * 2.6)
+
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         p.fillRect(self.rect(), qcol(C.BG))
 
-        W, H = self.width(), self.height()
-        cx, cy = W / 2, H / 2
-        fw = min(W, H)
+        width, height = self.width(), self.height()
+        cx, cy = width / 2.0, height / 2.0 - 7.0
+        frame = min(width, height)
+        radius = frame * 0.34
+        base_hex, accent_hex = self._active_colors()
 
-        # grid dots
-        p.setPen(QPen(qcol(C.PRI_GHO), 1))
-        for x in range(0, W, 48):
-            for y in range(0, H, 48):
-                p.drawPoint(x, y)
+        self._paint_depth_field(p, cx, cy, radius, base_hex)
+        self._paint_core_glow(p, cx, cy, radius, base_hex, accent_hex)
+        self._paint_orbits(p, cx, cy, radius, base_hex, accent_hex)
+        self._paint_halo_particles(p, cx, cy, radius, base_hex, accent_hex)
+        self._paint_particle_sphere(p, cx, cy, radius, base_hex, accent_hex)
+        self._paint_comets(p, cx, cy, radius, accent_hex)
 
-        r_face = fw * 0.31
-
-        # halo glow
-        for i in range(10):
-            r   = r_face * (1.8 - i * 0.08)
-            frc = 1.0 - i / 10
-            a   = max(0, min(255, int(self._halo * 0.085 * frc)))
-            col = qcol(C.MUTED_C if self.muted else C.PRI, a)
-            p.setPen(QPen(col, 1.5)); p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(QRectF(cx - r, cy - r, r * 2, r * 2))
-
-        # pulse rings
-        for pr in self._pulses:
-            a   = max(0, int(230 * (1.0 - pr / (fw * 0.74))))
-            col = qcol(C.MUTED_C if self.muted else C.PRI, a)
-            p.setPen(QPen(col, 1.5)); p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(QRectF(cx - pr, cy - pr, pr * 2, pr * 2))
-
-        # spinning arc rings
-        for idx, (r_frac, w_r, arc_l, gap) in enumerate(
-            [(0.48, 3, 115, 78), (0.40, 2, 78, 55), (0.32, 1, 56, 40)]
-        ):
-            ring_r = fw * r_frac
-            base   = self._rings[idx]
-            a_val  = max(0, min(255, int(self._halo * (1.0 - idx * 0.18))))
-            col    = qcol(C.MUTED_C if self.muted else C.PRI, a_val)
-            p.setPen(QPen(col, w_r)); p.setBrush(Qt.BrushStyle.NoBrush)
-            angle = base
-            rect  = QRectF(cx - ring_r, cy - ring_r, ring_r * 2, ring_r * 2)
-            while angle < base + 360:
-                p.drawArc(rect, int(angle * 16), int(arc_l * 16))
-                angle += arc_l + gap
-
-        # scanners
-        sr = fw * 0.50
-        sa = min(255, int(self._halo * 1.5))
-        ex = 75 if self.speaking else 44
-        p.setPen(QPen(qcol(C.MUTED_C if self.muted else C.PRI, sa), 2.5))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        srect = QRectF(cx - sr, cy - sr, sr * 2, sr * 2)
-        p.drawArc(srect, int(self._scan * 16), int(ex * 16))
-        p.setPen(QPen(qcol(C.ACC, sa // 2), 1.5))
-        p.drawArc(srect, int(self._scan2 * 16), int(ex * 16))
-
-        # tick marks
-        t_out, t_in = fw * 0.497, fw * 0.474
-        p.setPen(QPen(qcol(C.PRI, 140), 1))
-        for deg in range(0, 360, 10):
-            rad = math.radians(deg)
-            inn = t_in if deg % 30 == 0 else t_in + 6
-            p.drawLine(
-                QPointF(cx + t_out * math.cos(rad), cy - t_out * math.sin(rad)),
-                QPointF(cx + inn  * math.cos(rad), cy - inn  * math.sin(rad)),
-            )
-
-        # crosshair
-        ch_r, gap_h = fw * 0.51, fw * 0.16
-        p.setPen(QPen(qcol(C.PRI, int(self._halo * 0.5)), 1))
-        p.drawLine(QPointF(cx - ch_r, cy), QPointF(cx - gap_h, cy))
-        p.drawLine(QPointF(cx + gap_h, cy), QPointF(cx + ch_r, cy))
-        p.drawLine(QPointF(cx, cy - ch_r), QPointF(cx, cy - gap_h))
-        p.drawLine(QPointF(cx, cy + gap_h), QPointF(cx, cy + ch_r))
-
-        # corner brackets
-        bl = 24
-        bc = qcol(C.PRI, 210)
-        hl, hr = cx - fw // 2, cx + fw // 2
-        ht, hb = cy - fw // 2, cy + fw // 2
-        p.setPen(QPen(bc, 2))
-        for bx, by, dx, dy in [(hl,ht,1,1),(hr,ht,-1,1),(hl,hb,1,-1),(hr,hb,-1,-1)]:
-            p.drawLine(QPointF(bx, by), QPointF(bx + dx * bl, by))
-            p.drawLine(QPointF(bx, by), QPointF(bx, by + dy * bl))
-
-        # face
-        if self._face_px:
-            fsz    = int(fw * 0.62 * self._scale)
-            scaled = self._face_px.scaled(
-                fsz, fsz,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            p.drawPixmap(int(cx - fsz / 2), int(cy - fsz / 2), scaled)
-        else:
-            orb_r = int(fw * 0.27 * self._scale)
-            oc    = (200, 0, 50) if self.muted else (0, 60, 110)
-            for i in range(8, 0, -1):
-                r2  = int(orb_r * i / 8)
-                frc = i / 8
-                a   = max(0, min(255, int(self._halo * 1.1 * frc)))
-                p.setBrush(QBrush(QColor(int(oc[0]*frc), int(oc[1]*frc), int(oc[2]*frc), a)))
-                p.setPen(Qt.PenStyle.NoPen)
-                p.drawEllipse(QRectF(cx - r2, cy - r2, r2 * 2, r2 * 2))
-            p.setPen(QPen(qcol(C.PRI, min(255, int(self._halo * 2))), 1))
-            p.setFont(QFont("Courier New", 13, QFont.Weight.Bold))
-            p.drawText(QRectF(cx - 80, cy - 14, 160, 28),
-                       Qt.AlignmentFlag.AlignCenter, self._assistant_name)
-
-        # particles
-        for pt in self._particles:
-            a = max(0, min(255, int(pt[4] * 255)))
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(qcol(C.PRI, a)))
-            p.drawEllipse(QPointF(pt[0], pt[1]), 2.5, 2.5)
-
-        # status text
-        sy = cy + fw * 0.40
-        if self.muted:
-            txt, col = "⊘  MUTED",     qcol(C.MUTED_C)
-        elif self.speaking:
-            txt, col = "●  SPEAKING",  qcol(C.ACC)
+        # Status and waveform retain their existing placement and semantics.
+        status_y = cy + frame * 0.405
+        if self.muted or self.state == "MUTED":
+            text, color = "⊘  MUTED", qcol(C.MUTED_C)
+        elif self.speaking or self.state == "SPEAKING":
+            text, color = "●  SPEAKING", qcol(C.ACC)
         elif self.state == "THINKING":
-            sym = "◈" if self._blink else "◇"
-            txt, col = f"{sym}  THINKING",   qcol(C.ACC2)
+            symbol = "◈" if self._blink else "◇"
+            text, color = f"{symbol}  THINKING", qcol(C.ACC2)
         elif self.state == "PROCESSING":
-            sym = "▷" if self._blink else "▶"
-            txt, col = f"{sym}  PROCESSING", qcol(C.ACC2)
+            symbol = "▷" if self._blink else "▶"
+            text, color = f"{symbol}  PROCESSING", qcol(C.ACC2)
         elif self.state == "LISTENING":
-            sym = "●" if self._blink else "○"
-            txt, col = f"{sym}  LISTENING",  qcol(C.GREEN)
+            symbol = "●" if self._blink else "○"
+            text, color = f"{symbol}  LISTENING", qcol(C.GREEN)
         else:
-            sym = "●" if self._blink else "○"
-            txt, col = f"{sym}  {self.state}", qcol(C.PRI)
+            symbol = "●" if self._blink else "○"
+            text, color = f"{symbol}  {self.state}", qcol(C.PRI)
 
-        p.setPen(QPen(col, 1))
+        p.setPen(QPen(color, 1))
         p.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
-        p.drawText(QRectF(0, sy, W, 26), Qt.AlignmentFlag.AlignCenter, txt)
+        p.drawText(QRectF(0, status_y, width, 26), Qt.AlignmentFlag.AlignCenter, text)
 
-        # waveform
-        wy = sy + 30
-        N, bw = 36, 8
-        wx0 = (W - N * bw) / 2
-        for i in range(N):
+        wave_y = status_y + 31
+        bars, bar_width = 38, 7
+        wave_x = (width - bars * bar_width) / 2.0
+        for i in range(bars):
+            phase = i * 0.62
             if self.muted:
-                hgt, cl = 2, qcol(C.MUTED_C)
-            elif self.speaking:
-                hgt = random.randint(3, 20)
-                cl  = qcol(C.PRI) if hgt > 12 else qcol(C.PRI_DIM)
+                bar_height = 2.0
+                bar_color = qcol(C.MUTED_C, 150)
             else:
-                hgt = int(3 + 2 * math.sin(self._tick * 0.09 + i * 0.6))
-                cl  = qcol(C.BORDER_B)
-            p.fillRect(QRectF(wx0 + i * bw, wy + 20 - hgt, bw - 1, hgt), cl)
+                carrier = 0.5 + 0.5 * math.sin(self._time * (4.0 + self._energy * 8.0) + phase)
+                modulation = 0.5 + 0.5 * math.sin(self._time * 2.3 - phase * 0.37)
+                bar_height = 2.0 + (3.0 + self._energy * 17.0) * carrier * modulation
+                bar_color = qcol(accent_hex if carrier > 0.68 else base_hex, 190)
+            p.fillRect(
+                QRectF(wave_x + i * bar_width, wave_y + 20 - bar_height,
+                       bar_width - 1, bar_height),
+                bar_color,
+            )
 
 class MetricBar(QWidget):
 
