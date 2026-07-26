@@ -24,8 +24,8 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QBrush, QColor, QConicalGradient, QDragEnterEvent, QDropEvent, QFont,
-    QFontDatabase, QKeySequence, QLinearGradient, QPainter, QPainterPath,
-    QPen, QPixmap, QRadialGradient, QShortcut,
+    QFontDatabase, QGuiApplication, QKeySequence, QLinearGradient, QPainter,
+    QPainterPath, QPen, QPixmap, QRadialGradient, QShortcut,
 )
 from PyQt6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
@@ -3248,10 +3248,36 @@ class _RootShim:
         pass
 
 
+def _configure_qt_application() -> None:
+    """Apply platform-safe Qt defaults before QApplication is created.
+
+    Qt 6 handles Retina scaling automatically. PassThrough preserves the exact
+    device scale reported by macOS instead of rounding it, while leaving the
+    custom HUD geometry and styling untouched.
+    """
+    QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
+    QApplication.setApplicationName("MARK L")
+    QGuiApplication.setApplicationDisplayName("MARK L")
+    QApplication.setOrganizationName("FatihMakes")
+    QApplication.setOrganizationDomain("github.com/FatihMakes")
+
+
 class JarvisUI:
     def __init__(self, face_path: str, size=None):
-        self._app = QApplication.instance() or QApplication(sys.argv)
-        self._app.setStyle("Fusion")
+        existing_app = QApplication.instance()
+        if existing_app is None:
+            _configure_qt_application()
+            self._app = QApplication(sys.argv)
+        else:
+            self._app = existing_app
+
+        # Keep the native Cocoa Qt style on macOS. The futuristic appearance
+        # remains defined by the existing stylesheets and custom HUD painting.
+        if _OS != "Darwin":
+            self._app.setStyle("Fusion")
+
         self._win = MainWindow(face_path)
         self._win.show()
         self.root = _RootShim(self._app)
