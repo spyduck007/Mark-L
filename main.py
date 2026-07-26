@@ -17,6 +17,7 @@ if _platform.system() == "Windows":
 
 import asyncio
 from collections import deque
+import os
 import re
 import threading
 import time
@@ -89,6 +90,192 @@ VOICE_MODEL_DIR      = BASE_DIR / "config" / "voice_models"
 VOICE_METRICS_PATH   = BASE_DIR / "config" / "voice_metrics.json"
 WAKE_CALIBRATION_PATH = BASE_DIR / "config" / "wake_calibration.json"
 SPEAKER_PROFILE_PATH  = BASE_DIR / "config" / "speaker_profile.json"
+
+_HEADPHONE_HINTS = (
+    "airpods", "headphone", "headphones", "headset", "earbud", "earbuds",
+    "earphone", "earphones", "buds", "beats", "bose", "jabra", "sony",
+    "quietcomfort", "bluetooth", "usb audio", "steelseries", "arctis",
+    "hyperx", "logitech", "astro", "razer", "corsair", "external headphones",
+)
+_BUILTIN_AUDIO_HINTS = (
+    "macbook", "built-in", "built in", "display audio", "blackhole",
+    "aggregate", "multi-output", "multi output", "zoom audio", "teams audio",
+    "iphone microphone", "continuity microphone",
+)
+_AUDIO_GENERIC_WORDS = {
+    "audio", "device", "input", "output", "microphone", "mic", "speaker",
+    "speakers", "headphone", "headphones", "headset", "stereo", "handsfree",
+    "hands", "free", "default",
+}
+
+
+def _device_supports(device: dict, direction: str) -> bool:
+    key = "max_input_channels" if direction == "input" else "max_output_channels"
+    try:
+        return int(device.get(key, 0)) > 0
+    except Exception:
+        return False
+
+
+def _headphone_score(name: str) -> int:
+    lowered = str(name).casefold()
+    score = sum(25 for hint in _HEADPHONE_HINTS if hint in lowered)
+    score -= sum(60 for hint in _BUILTIN_AUDIO_HINTS if hint in lowered)
+    return score
+
+
+def _audio_family_tokens(name: str) -> set[str]:
+    tokens = set(re.findall(r"[a-z0-9]+", str(name).casefold()))
+    return {token for token in tokens if token not in _AUDIO_GENERIC_WORDS and len(token) > 1}
+
+
+def _device_name(devices: list[dict], index: int | None) -> str:
+    if index is None or index < 0 or index >= len(devices):
+        return "system default"
+    return str(devices[index].get("name", f"device {index}"))
+
+
+def _resolve_audio_device(
+    devices: list[dict], requested, direction: str,
+) -> int | None:
+    if requested is None or str(requested).strip().casefold() in {"", "auto", "default"}:
+        return None
+    try:
+        index = int(requested)
+    except (TypeError, ValueError):
+        index = None
+    if index is not None:
+        if 0 <= index < len(devices) and _device_supports(devices[index], direction):
+            return index
+        return None
+
+    needle = str(requested).strip().casefold()
+    capable = [
+        (index, device) for index, device in enumerate(devices)
+        if _device_supports(device, direction)
+    ]
+    for index, device in capable:
+        if str(device.get("name", "")).casefold() == needle:
+            return index
+    matches = [
+        index for index, device in capable
+        if needle in str(device.get("name", "")).casefold()
+    ]
+    return matches[0] if matches else None
+
+
+def _default_audio_index(devices: list[dict], direction: str) -> int | None:
+    try:
+        defaults = sd.default.device
+        raw = defaults[0 if direction == "input" else 1]
+        index = int(raw)
+    except Exception:
+        return None
+    if 0 <= index < len(devices) and _device_supports(devices[index], direction):
+        return index
+    return None
+
+
+def _select_audio_devices(config: dict) -> dict:
+    """Prefer a connected headset and pin both streams to explicit devices."""
+    devices = [dict(device) for device in sd.query_devices()]
+    if not devices:
+        return {
+            "input_index": None,
+            "output_index": None,
+            "input_name": "system default",
+            "output_name": "system default",
+            "headphones": False,
+            "notes": ["No PortAudio devices were reported."],
+        }
+
+    requested_both = os.getenv("MARKL_AUDIO_DEVICE") or config.get("audio_device")
+    requested_input = (
+        os.getenv("MARKL_INPUT_DEVICE")
+        or config.get("audio_input_device")
+        or requested_both
+    )
+    requested_output = (
+        os.getenv("MARKL_OUTPUT_DEVICE")
+        or config.get("audio_output_device")
+        or requested_both
+    )
+    prefer_headphones = bool(config.get("prefer_headphones", True))
+    notes: list[str] = []
+
+    input_index = _resolve_audio_device(devices, requested_input, "input")
+    output_index = _resolve_audio_device(devices, requested_output, "output")
+    if requested_input is not None and input_index is None:
+        notes.append(f"Requested input device not found: {requested_input}")
+    if requested_output is not None and output_index is None:
+        notes.append(f"Requested output device not found: {requested_output}")
+
+    if output_index is None and prefer_headphones:
+        output_candidates = [
+            (index, _headphone_score(device.get("name", "")))
+            for index, device in enumerate(devices)
+            if _device_supports(device, "output")
+        ]
+        if output_candidates:
+            best_output, best_score = max(output_candidates, key=lambda item: item[1])
+            if best_score > 0:
+                output_index = best_output
+
+    if output_index is None:
+        output_index = _default_audio_index(devices, "output")
+
+    if input_index is None and prefer_headphones and output_index is not None:
+        output_device = devices[output_index]
+        output_name = str(output_device.get("name", ""))
+        output_tokens = _audio_family_tokens(output_name)
+        if _device_supports(output_device, "input") and _headphone_score(output_name) > 0:
+            input_index = output_index
+        else:
+            input_candidates = []
+            for index, device in enumerate(devices):
+                if not _device_supports(device, "input"):
+                    continue
+                name = str(device.get("name", ""))
+                tokens = _audio_family_tokens(name)
+                shared = len(output_tokens & tokens)
+                union = len(output_tokens | tokens) or 1
+                similarity = shared / union
+                score = _headphone_score(name) + round(similarity * 100)
+                input_candidates.append((index, score, similarity))
+            if input_candidates:
+                best_input, best_score, similarity = max(
+                    input_candidates, key=lambda item: item[1]
+                )
+                if best_score > 0 or similarity >= 0.35:
+                    input_index = best_input
+
+    if input_index is None:
+        input_index = _default_audio_index(devices, "input")
+
+    if input_index is not None and output_index is not None:
+        try:
+            sd.default.device = (input_index, output_index)
+        except Exception as exc:
+            notes.append(f"Could not set sounddevice defaults: {exc}")
+
+    output_name = _device_name(devices, output_index)
+    input_name = _device_name(devices, input_index)
+    headphones = _headphone_score(output_name) > 0
+    if headphones and _headphone_score(input_name) <= 0:
+        notes.append(
+            "Headphone output selected, but no matching headset microphone was found; "
+            "using the current input device."
+        )
+
+    return {
+        "input_index": input_index,
+        "output_index": output_index,
+        "input_name": input_name,
+        "output_name": output_name,
+        "headphones": headphones,
+        "notes": notes,
+    }
+
 
 def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -670,6 +857,10 @@ class JarvisLive:
         self._last_speaker_verified = False
         self._last_speaker_score = 0.0
         self._voice_engine: VoiceAudioEngine | None = None
+        self._audio_input_device: int | None = None
+        self._audio_output_device: int | None = None
+        self._audio_input_name = "system default"
+        self._audio_output_name = "system default"
         self._mic_queue: asyncio.Queue | None = None
         self._local_speech_active = False
         self._barge_in_candidate_since = 0.0
@@ -695,6 +886,34 @@ class JarvisLive:
             _voice_cfg = json.loads(API_CONFIG_PATH.read_text(encoding="utf-8"))
         except Exception:
             _voice_cfg = {}
+        try:
+            _audio_route = _select_audio_devices(_voice_cfg)
+        except Exception as exc:
+            _audio_route = {
+                "input_index": None,
+                "output_index": None,
+                "input_name": "system default",
+                "output_name": "system default",
+                "headphones": False,
+                "notes": [f"Audio device detection failed: {exc}"],
+            }
+        self._audio_input_device = _audio_route["input_index"]
+        self._audio_output_device = _audio_route["output_index"]
+        self._audio_input_name = _audio_route["input_name"]
+        self._audio_output_name = _audio_route["output_name"]
+        print(
+            f"[Audio] Input  [{self._audio_input_device}]: {self._audio_input_name}"
+        )
+        print(
+            f"[Audio] Output [{self._audio_output_device}]: {self._audio_output_name}"
+        )
+        for _audio_note in _audio_route["notes"]:
+            print(f"[Audio] Note: {_audio_note}")
+        if not _audio_route["headphones"]:
+            print(
+                "[Audio] No headphone output was auto-detected. "
+                "Set MARKL_AUDIO_DEVICE or MARKL_OUTPUT_DEVICE to a device name."
+            )
         self._speaker_enabled = bool(_voice_cfg.get("speaker_verification_enabled", False))
         self._barge_in_min_duration = max(0.15, min(1.0, float(
             _voice_cfg.get("barge_in_min_duration_seconds", 0.32)
@@ -1436,6 +1655,7 @@ class JarvisLive:
 
         try:
             with sd.InputStream(
+                device=self._audio_input_device,
                 samplerate=SEND_SAMPLE_RATE,
                 channels=CHANNELS,
                 dtype="int16",
@@ -1745,6 +1965,7 @@ class JarvisLive:
         print("[JARVIS] 🔊 Play started")
 
         stream = sd.RawOutputStream(
+            device=self._audio_output_device,
             samplerate=RECEIVE_SAMPLE_RATE,
             channels=CHANNELS,
             dtype="int16",
