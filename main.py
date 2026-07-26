@@ -1033,9 +1033,10 @@ class JarvisLive:
             input_audio_transcription={},
             system_instruction="\n".join(parts),
             tools=[{"function_declarations": TOOL_DECLARATIONS}],
+            # The public Gemini API supports resumption handles but rejects
+            # the Vertex-only transparent mode during Live conversion.
             session_resumption=types.SessionResumptionConfig(
                 handle=self._session_handle,
-                transparent=True,
             ),
             context_window_compression=types.ContextWindowCompressionConfig(
                 trigger_tokens=25000,
@@ -2152,12 +2153,27 @@ class JarvisLive:
                     self._voice_metrics.increment("reconnects")
                     continue
 
+                # Deterministic SDK/configuration errors cannot recover through
+                # rapid reconnects. Surface them and retry slowly instead.
+                is_config_err = (
+                    type(e).__name__ == "ValidationError"
+                    or "not supported in Gemini API" in err_str
+                    or "Extra inputs are not permitted" in err_str
+                )
+                if is_config_err:
+                    self._conn_backoff = 60
+                    self.ui.write_log(
+                        f"ERR: Live SDK configuration error: {err_str}. Retrying in 60s."
+                    )
+
                 # Network / timeout errors — log clearly and back off
                 is_net_err = any(k in err_str for k in (
                     "TimeoutError", "timed out", "getaddrinfo", "CancelledError",
                     "ConnectionRefusedError", "OSError", "Cannot connect",
                 ))
-                if is_net_err:
+                if is_config_err:
+                    pass
+                elif is_net_err:
                     _conn_backoff = min(getattr(self, "_conn_backoff", 3) * 2, 60)
                     self._conn_backoff = _conn_backoff
                     self.ui.write_log(
