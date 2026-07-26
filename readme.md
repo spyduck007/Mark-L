@@ -115,6 +115,23 @@ MARK L can keep computer-microphone audio local until the configured wake phrase
 
 While wake-word mode is armed, ordinary room audio is not forwarded to Gemini Live. Phone microphone and typed dashboard commands remain independent of the computer-microphone gate.
 
+### Full-duplex voice engine
+
+MARK L keeps the existing Gemini 2.5 native-audio model while adding a smarter local audio layer:
+
+- **Local Silero VAD:** speech boundaries are decided on-device and sent to Gemini as explicit activity start/end signals.
+- **Natural barge-in:** you can interrupt JARVIS while it is speaking; queued speech stops and the new utterance begins immediately.
+- **Echo cancellation and noise suppression:** the exact playback stream is used as an echo reference. WebRTC AEC is used when its optional native binding is available; a built-in adaptive suppressor works everywhere else.
+- **Adaptive follow-up timing:** short commands return to standby sooner, while questions, tools, and vision turns remain open longer.
+- **Seamless session rotation:** Gemini session-resumption handles and context-window compression preserve continuity across Live connection limits.
+- **Action confirmations:** disruptive or sensitive actions return a confirmation token and execute only after a clear verbal confirmation.
+- **Cancellable tool jobs:** model cancellation messages stop in-flight asynchronous jobs when possible.
+- **Voice metrics:** local wake, VAD, interruption, response-latency, and reconnect measurements are stored in `config/voice_metrics.json`.
+- **Adaptive wake calibration:** ambient noise and successful detections produce a device-specific sensitivity recommendation. Say "mark that as a false wake" or ask for wake calibration status.
+- **Optional owner voice:** enroll the latest clear utterance through JARVIS, then enable owner-voice verification for sensitive confirmations. Embeddings and models stay local.
+
+Advanced controls are available in **Wake Word Settings**: VAD threshold, echo delay, echo cancellation, follow-up timing, and owner-voice protection. The first use downloads small local VAD assets; speaker verification downloads its model only when enrollment is requested. Optional native WebRTC AEC can be added with `pip install aec-audio-processing` on supported Python/platform combinations; MARK L does not require it.
+
 ---
 
 ## 📋 Requirements

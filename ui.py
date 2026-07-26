@@ -1596,7 +1596,7 @@ class WakeWordOverlay(QWidget):
     """Account-free local wake-word configuration panel."""
 
     saved = pyqtSignal(dict)
-    _OW, _OH = 440, 410
+    _OW, _OH = 440, 540
 
     def __init__(self, config: dict, parent=None):
         super().__init__(parent)
@@ -1609,6 +1609,8 @@ class WakeWordOverlay(QWidget):
             }}
         """)
         self._enabled = bool(config.get("wake_word_enabled", True))
+        self._aec_enabled = bool(config.get("echo_cancellation_enabled", True))
+        self._speaker_enabled = bool(config.get("speaker_verification_enabled", False))
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(24, 18, 24, 18)
@@ -1664,6 +1666,33 @@ class WakeWordOverlay(QWidget):
         numbers.addLayout(right)
         lay.addLayout(numbers)
 
+        audio_numbers = QHBoxLayout(); audio_numbers.setSpacing(8)
+        vad_col = QVBoxLayout(); vad_col.setSpacing(3)
+        vad_col.addWidget(label("LOCAL VAD THRESHOLD  0.1–0.9"))
+        self._vad_threshold = QLineEdit(str(config.get("vad_threshold", 0.5)))
+        self._vad_threshold.setStyleSheet(field_style); vad_col.addWidget(self._vad_threshold)
+        audio_numbers.addLayout(vad_col)
+        delay_col = QVBoxLayout(); delay_col.setSpacing(3)
+        delay_col.addWidget(label("ECHO DELAY  milliseconds"))
+        self._echo_delay = QLineEdit(str(config.get("echo_stream_delay_ms", 80)))
+        self._echo_delay.setStyleSheet(field_style); delay_col.addWidget(self._echo_delay)
+        audio_numbers.addLayout(delay_col)
+        lay.addLayout(audio_numbers)
+
+        toggles = QHBoxLayout(); toggles.setSpacing(8)
+        self._aec_btn = QPushButton()
+        self._aec_btn.setCheckable(True)
+        self._aec_btn.setChecked(self._aec_enabled)
+        self._aec_btn.clicked.connect(self._toggle_aec)
+        toggles.addWidget(self._aec_btn)
+        self._speaker_btn = QPushButton()
+        self._speaker_btn.setCheckable(True)
+        self._speaker_btn.setChecked(self._speaker_enabled)
+        self._speaker_btn.clicked.connect(self._toggle_speaker)
+        toggles.addWidget(self._speaker_btn)
+        lay.addLayout(toggles)
+        self._style_audio_toggles()
+
         lay.addWidget(label(
             "On first activation MARK L downloads the official compact keyword model once (about 32 MB). Afterwards detection is fully local and room audio stays off Gemini until the phrase is heard.",
             7, C.ACC2,
@@ -1700,10 +1729,28 @@ class WakeWordOverlay(QWidget):
                 f"color: {C.ACC2}; background: #161000; border: 1px solid {C.ACC2}; border-radius: 3px;"
             )
 
+    def _toggle_aec(self, checked: bool):
+        self._aec_enabled = bool(checked)
+        self._style_audio_toggles()
+
+    def _toggle_speaker(self, checked: bool):
+        self._speaker_enabled = bool(checked)
+        self._style_audio_toggles()
+
+    def _style_audio_toggles(self):
+        active = f"color: {C.GREEN}; background: #00140a; border: 1px solid {C.GREEN_D}; border-radius: 3px;"
+        inactive = f"color: {C.TEXT_DIM}; background: #081018; border: 1px solid {C.BORDER}; border-radius: 3px;"
+        self._aec_btn.setText("AEC: ON" if self._aec_enabled else "AEC: OFF")
+        self._aec_btn.setStyleSheet(active if self._aec_enabled else inactive)
+        self._speaker_btn.setText("OWNER VOICE: ON" if self._speaker_enabled else "OWNER VOICE: OFF")
+        self._speaker_btn.setStyleSheet(active if self._speaker_enabled else inactive)
+
     def _save(self):
         try:
             sensitivity = max(0.0, min(1.0, float(self._sensitivity.text().strip() or "0.55")))
             timeout = max(2.0, min(60.0, float(self._timeout.text().strip() or "10")))
+            vad_threshold = max(0.1, min(0.9, float(self._vad_threshold.text().strip() or "0.5")))
+            echo_delay = max(0, min(500, int(self._echo_delay.text().strip() or "80")))
         except ValueError:
             self._sensitivity.setStyleSheet(
                 self._sensitivity.styleSheet()
@@ -1716,6 +1763,10 @@ class WakeWordOverlay(QWidget):
             "wake_word_sensitivity": sensitivity,
             "follow_up_timeout_seconds": timeout,
             "wake_word_pre_roll_ms": 750,
+            "vad_threshold": vad_threshold,
+            "echo_cancellation_enabled": self._aec_enabled,
+            "echo_stream_delay_ms": echo_delay,
+            "speaker_verification_enabled": self._speaker_enabled,
         }
         self.saved.emit(values)
         self.hide()

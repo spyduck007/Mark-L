@@ -34,6 +34,12 @@ from core.model_config import HELPER_MODEL
 from core.wake_word import (
     WakeWordConfigurationError, WakeWordDetector, WakeWordSettings,
 )
+from core.audio_engine import VoiceAudioEngine
+from core.conversation_state import ConversationStateManager, DialogueState
+from core.tool_jobs import RiskLevel, ToolJobManager
+from core.voice_metrics import VoiceMetrics
+from core.wake_calibration import WakeCalibration
+from core.speaker_identity import SpeakerIdentity
 from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt,
     save_session_summary, pop_last_session,
@@ -79,6 +85,10 @@ CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
 CHUNK_SIZE          = 1024
+VOICE_MODEL_DIR      = BASE_DIR / "config" / "voice_models"
+VOICE_METRICS_PATH   = BASE_DIR / "config" / "voice_metrics.json"
+WAKE_CALIBRATION_PATH = BASE_DIR / "config" / "wake_calibration.json"
+SPEAKER_PROFILE_PATH  = BASE_DIR / "config" / "speaker_profile.json"
 
 def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -532,6 +542,58 @@ TOOL_DECLARATIONS = [
     }
 },
     {
+        "name": "confirm_pending_action",
+        "description": (
+            "Execute a previously blocked sensitive action only after the user has explicitly confirmed it. "
+            "Use the exact action_id returned by the earlier tool response."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action_id": {"type": "STRING", "description": "Pending action identifier"}
+            },
+            "required": ["action_id"]
+        }
+    },
+    {
+        "name": "cancel_pending_action",
+        "description": "Cancel a sensitive action that is waiting for user confirmation.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action_id": {"type": "STRING", "description": "Pending action identifier"}
+            },
+            "required": ["action_id"]
+        }
+    },
+    {
+        "name": "voice_system_status",
+        "description": "Returns local wake-word, VAD, echo-cancellation, latency, and reconnect metrics.",
+        "parameters": {"type": "OBJECT", "properties": {}}
+    },
+    {
+        "name": "wake_calibration",
+        "description": "Inspect or adjust local wake-word calibration. Actions: status, apply_recommendation, mark_false_wake, reset.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "status | apply_recommendation | mark_false_wake | reset"}
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "speaker_identity",
+        "description": "Manage optional local owner-voice verification. Actions: status, enroll_last_utterance, enable, disable, clear.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "status | enroll_last_utterance | enable | disable | clear"}
+            },
+            "required": ["action"]
+        }
+    },
+    {
         "name": "save_memory",
         "description": (
             "Save an important personal fact about the user to long-term memory. "
@@ -578,6 +640,7 @@ class JarvisLive:
         self._is_speaking         = False
         self._speaking_lock       = threading.Lock()
         self._phone_active        = False   # True while phone mic is streaming; pauses PC mic
+        self._phone_speech_active = False
         self._pending_vision       = None    # (img_bytes, mime_type, question, angle) to inject after tool response
         self._vision_cam_active    = False   # True if camera was opened for vision → auto-close after response
         self._vision_close_pending = False   # True after vision injected; next turn_complete closes camera
@@ -595,10 +658,44 @@ class JarvisLive:
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
+        self._voice_state = ConversationStateManager(self.ui.set_state)
+        self._voice_metrics = VoiceMetrics(VOICE_METRICS_PATH)
+        self._wake_calibration = WakeCalibration(
+            WAKE_CALIBRATION_PATH, self._wake_settings.sensitivity if hasattr(self, "_wake_settings") else 0.55
+        )
+        self._speaker_identity: SpeakerIdentity | None = None
+        self._speaker_enabled = False
+        self._last_user_audio = b""
+        self._current_user_audio = bytearray()
+        self._last_speaker_verified = False
+        self._last_speaker_score = 0.0
+        self._voice_engine: VoiceAudioEngine | None = None
+        self._mic_queue: asyncio.Queue | None = None
+        self._local_speech_active = False
+        self._speech_started_at = 0.0
+        self._speech_ended_at = 0.0
+        self._last_playback_started_at = 0.0
+        self._session_handle: str | None = None
+        self._planned_reconnect = False
+        self._tool_jobs = ToolJobManager()
+        self._pending_actions: dict[str, dict] = {}
+        self._confirmed_calls: set[str] = set()
+        self._turn_used_tool = False
 
         # Local wake-word gate. When sherpa-onnx is ready, PC microphone
         # audio reaches Gemini only while this gate is open.
         self._wake_settings = WakeWordSettings.load(API_CONFIG_PATH)
+        self._wake_calibration.sensitivity = self._wake_settings.sensitivity
+        try:
+            _voice_cfg = json.loads(API_CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            _voice_cfg = {}
+        self._speaker_enabled = bool(_voice_cfg.get("speaker_verification_enabled", False))
+        self._speaker_identity = SpeakerIdentity(
+            VOICE_MODEL_DIR / "3dspeaker-owner.onnx",
+            SPEAKER_PROFILE_PATH,
+            threshold=float(_voice_cfg.get("speaker_verification_threshold", 0.65)),
+        )
         self._wake_detector: WakeWordDetector | None = None
         self._wake_queue: asyncio.Queue | None = None
         self._wake_gate_open = threading.Event()
@@ -619,10 +716,56 @@ class JarvisLive:
             return "FOLLOW_UP"
         return "LISTENING"
 
+    def _set_dialogue_state(self, state: DialogueState, reason: str = "") -> None:
+        self._voice_state.set(state, reason)
+
+    async def _send_activity_start(self) -> None:
+        if self.session:
+            await self.session.send_realtime_input(activity_start=types.ActivityStart())
+
+    async def _send_activity_end(self) -> None:
+        if self.session:
+            await self.session.send_realtime_input(activity_end=types.ActivityEnd())
+
+    async def _update_voice_config(self, values: dict) -> None:
+        def _write():
+            try:
+                data = json.loads(API_CONFIG_PATH.read_text(encoding="utf-8"))
+            except Exception:
+                data = {}
+            data.update(values)
+            API_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = API_CONFIG_PATH.with_suffix(API_CONFIG_PATH.suffix + ".tmp")
+            tmp.write_text(json.dumps(data, indent=4), encoding="utf-8")
+            tmp.replace(API_CONFIG_PATH)
+        await asyncio.to_thread(_write)
+
     def _on_wake_settings_changed(self) -> None:
         if not self._loop:
             return
         asyncio.run_coroutine_threadsafe(self._reload_wake_word(), self._loop)
+
+    async def _reload_voice_engine(self) -> None:
+        try:
+            cfg = json.loads(API_CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            cfg = {}
+        self._voice_engine = await asyncio.to_thread(
+            VoiceAudioEngine,
+            VOICE_MODEL_DIR,
+            SEND_SAMPLE_RATE,
+            float(cfg.get("vad_threshold", 0.5)),
+            bool(cfg.get("echo_cancellation_enabled", True)),
+            int(cfg.get("echo_stream_delay_ms", 80)),
+        )
+        if self._voice_engine.conditioner_backend == "webrtc":
+            self.ui.write_log("SYS: WebRTC echo cancellation and noise suppression active.")
+        elif self._voice_engine.conditioner_backend == "adaptive-fallback":
+            self.ui.write_log(
+                "SYS: Built-in adaptive echo suppression active; install aec-audio-processing for WebRTC AEC."
+            )
+        else:
+            self.ui.write_log("SYS: Echo cancellation disabled; local VAD and barge-in remain active.")
 
     async def _reload_wake_word(self) -> None:
         async with self._wake_reload_lock:
@@ -637,6 +780,7 @@ class JarvisLive:
             chunk_ms = CHUNK_SIZE / SEND_SAMPLE_RATE * 1000.0
             self._wake_pre_roll_chunks = max(1, int(settings.pre_roll_ms / chunk_ms + 0.999))
             self._wake_pre_roll = deque(maxlen=self._wake_pre_roll_chunks)
+            await self._reload_voice_engine()
 
             if not settings.enabled:
                 self._wake_gate_open.set()
@@ -700,16 +844,13 @@ class JarvisLive:
             return
         self._wake_gate_open.set()
         self._wake_turn_in_progress = True
+        self._voice_metrics.increment("wake_detections")
+        self._set_dialogue_state(DialogueState.AWAITING_COMMAND, "wake phrase")
         self._wake_deadline = time.monotonic() + max(4.0, self._wake_settings.follow_up_timeout)
         self.ui.play_wake_feedback()
         self.ui.set_state("LISTENING")
         self.ui.write_log(f'SYS: Wake phrase detected — listening for command.')
         print(f"[WakeWord] detected: {self._wake_settings.phrase!r}")
-
-        # Replay the recent local buffer so commands spoken immediately after
-        # the wake phrase are not clipped at the cloud boundary.
-        while self._wake_pre_roll:
-            self._queue_realtime_audio(self._wake_pre_roll.popleft())
 
     def _enter_standby(self, reason: str = "timeout") -> None:
         if not self._wake_operational:
@@ -718,6 +859,9 @@ class JarvisLive:
         self._wake_deadline = 0.0
         self._wake_turn_in_progress = False
         self._wake_pre_roll.clear()
+        self._local_speech_active = False
+        if self._voice_engine:
+            self._voice_engine.reset()
         if self._wake_detector:
             self._wake_detector.reset()
         if not self.ui.muted:
@@ -782,13 +926,25 @@ class JarvisLive:
         with self._speaking_lock:
             self._is_speaking = value
         if value:
-            self.ui.set_state("SPEAKING")
+            self._set_dialogue_state(DialogueState.ASSISTANT_SPEAKING, "audio playback")
         elif not self.ui.muted:
-            self.ui.set_state(self._idle_voice_state())
+            if self._wake_operational and self._wake_gate_open.is_set():
+                self._set_dialogue_state(DialogueState.FOLLOW_UP, "playback complete")
+            elif self._wake_operational:
+                self._set_dialogue_state(DialogueState.STANDBY, "playback complete")
+            else:
+                self._set_dialogue_state(DialogueState.AWAITING_COMMAND, "playback complete")
 
-    def interrupt(self) -> None:
-        """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
+    def interrupt(self, auto: bool = False) -> None:
+        """Stop JARVIS mid-speech and let explicit activity interrupt the model."""
         self._interrupted = True
+        self._voice_metrics.increment("interruptions")
+        if self._last_playback_started_at:
+            self._voice_metrics.observe(
+                "barge_in_latency_ms",
+                (time.monotonic() - self._last_playback_started_at) * 1000.0,
+            )
+        self._set_dialogue_state(DialogueState.INTERRUPTED, "barge-in" if auto else "manual")
         q = self.audio_in_queue
         if q:
             drained = 0
@@ -861,6 +1017,8 @@ class JarvisLive:
             f"The local wake phrase may appear at the start of a user audio turn. "
             f"Treat it only as activation; answer the command after it. "
             f"If the user says only the wake phrase, respond with a very brief acknowledgement.\n"
+            f"When a tool returns confirmation_required with an action_id, ask one explicit confirmation question. "
+            f"Only after a clear yes call confirm_pending_action with that exact id; after a no call cancel_pending_action.\n"
             f"{_addr}\n\n"
         )
 
@@ -875,7 +1033,20 @@ class JarvisLive:
             input_audio_transcription={},
             system_instruction="\n".join(parts),
             tools=[{"function_declarations": TOOL_DECLARATIONS}],
-            session_resumption=types.SessionResumptionConfig(),
+            session_resumption=types.SessionResumptionConfig(
+                handle=self._session_handle,
+                transparent=True,
+            ),
+            context_window_compression=types.ContextWindowCompressionConfig(
+                trigger_tokens=25000,
+                sliding_window=types.SlidingWindow(target_tokens=12000),
+            ),
+            realtime_input_config=types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(disabled=True),
+                activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
+                turn_coverage=types.TurnCoverage.TURN_INCLUDES_ONLY_ACTIVITY,
+            ),
+            explicit_vad_signal=True,
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
@@ -886,6 +1057,141 @@ class JarvisLive:
         )
 
     async def _execute_tool(self, fc) -> types.FunctionResponse:
+        name = fc.name
+        args = dict(fc.args or {})
+
+        if name == "confirm_pending_action":
+            action_id = str(args.get("action_id", ""))
+            pending = self._pending_actions.pop(action_id, None)
+            if not pending:
+                return types.FunctionResponse(
+                    id=fc.id, name=name,
+                    response={"result": "No matching pending action exists."},
+                )
+            if (
+                self._speaker_enabled
+                and self._speaker_identity
+                and self._speaker_identity.enrolled
+                and not self._last_speaker_verified
+            ):
+                self._pending_actions[action_id] = pending
+                return types.FunctionResponse(
+                    id=fc.id, name=name,
+                    response={
+                        "result": "The confirmation was not spoken by the enrolled owner voice. Ask the owner to confirm again."
+                    },
+                )
+            class _ConfirmedCall:
+                pass
+            confirmed = _ConfirmedCall()
+            confirmed.id = fc.id
+            confirmed.name = pending["name"]
+            confirmed.args = pending["args"]
+            self._confirmed_calls.add(str(fc.id))
+            result = await self._execute_tool_impl(confirmed)
+            return types.FunctionResponse(
+                id=fc.id, name=name,
+                response={"result": result.response.get("result", "Done.")},
+            )
+
+        if name == "cancel_pending_action":
+            action_id = str(args.get("action_id", ""))
+            existed = self._pending_actions.pop(action_id, None) is not None
+            return types.FunctionResponse(
+                id=fc.id, name=name,
+                response={"result": "Cancelled." if existed else "No matching pending action exists."},
+            )
+
+        if name == "voice_system_status":
+            status = self._voice_metrics.summary()
+            status.update({
+                "model": LIVE_MODEL,
+                "wake_operational": self._wake_operational,
+                "wake_gate_open": self._wake_gate_open.is_set(),
+                "dialogue_state": self._voice_state.state.value,
+                "echo_cancellation": bool(self._voice_engine and self._voice_engine.conditioner),
+                "echo_backend": self._voice_engine.conditioner_backend if self._voice_engine else "unavailable",
+                "local_vad": bool(self._voice_engine),
+                "session_resumable": bool(self._session_handle),
+                "wake_calibration": self._wake_calibration.summary(),
+                "speaker_verification_enabled": self._speaker_enabled,
+                "speaker_enrolled": bool(self._speaker_identity and self._speaker_identity.enrolled),
+                "last_speaker_verified": self._last_speaker_verified,
+                "last_speaker_score": round(self._last_speaker_score, 3),
+            })
+            return types.FunctionResponse(id=fc.id, name=name, response={"result": status})
+
+        if name == "wake_calibration":
+            action = str(args.get("action", "status")).lower()
+            if action == "mark_false_wake":
+                sensitivity = self._wake_calibration.mark_false_wake()
+                await self._update_voice_config({"wake_word_sensitivity": sensitivity})
+                await self._reload_wake_word()
+                result = {"updated_sensitivity": sensitivity, **self._wake_calibration.summary()}
+            elif action == "apply_recommendation":
+                sensitivity = self._wake_calibration.recommended_sensitivity()
+                self._wake_calibration.sensitivity = sensitivity
+                self._wake_calibration.save()
+                await self._update_voice_config({"wake_word_sensitivity": sensitivity})
+                await self._reload_wake_word()
+                result = {"applied_sensitivity": sensitivity, **self._wake_calibration.summary()}
+            elif action == "reset":
+                self._wake_calibration.reset()
+                result = self._wake_calibration.summary()
+            else:
+                result = self._wake_calibration.summary()
+            return types.FunctionResponse(id=fc.id, name=name, response={"result": result})
+
+        if name == "speaker_identity":
+            action = str(args.get("action", "status")).lower()
+            if action == "enroll_last_utterance":
+                if not self._last_user_audio:
+                    result = "No recent clear utterance is available. Speak for at least one second and try again."
+                else:
+                    count = await asyncio.to_thread(self._speaker_identity.enroll, self._last_user_audio)
+                    result = f"Owner voice sample enrolled locally ({count}/5 samples)."
+            elif action == "enable":
+                self._speaker_enabled = True
+                await self._update_voice_config({"speaker_verification_enabled": True})
+                result = "Owner voice verification enabled for sensitive actions."
+            elif action == "disable":
+                self._speaker_enabled = False
+                await self._update_voice_config({"speaker_verification_enabled": False})
+                result = "Owner voice verification disabled."
+            elif action == "clear":
+                await asyncio.to_thread(self._speaker_identity.clear)
+                self._speaker_enabled = False
+                await self._update_voice_config({"speaker_verification_enabled": False})
+                result = "Local owner voice profile cleared."
+            else:
+                result = {
+                    "enabled": self._speaker_enabled,
+                    "enrolled": self._speaker_identity.enrolled,
+                    "last_verified": self._last_speaker_verified,
+                    "last_score": round(self._last_speaker_score, 3),
+                }
+            return types.FunctionResponse(id=fc.id, name=name, response={"result": result})
+
+        risk = self._tool_jobs.classify(name, args)
+        if risk != RiskLevel.SAFE and str(fc.id) not in self._confirmed_calls:
+            action_id = f"action-{int(time.time())}-{len(self._pending_actions)+1}"
+            self._pending_actions[action_id] = {"name": name, "args": args}
+            return types.FunctionResponse(
+                id=fc.id, name=name,
+                response={
+                    "confirmation_required": True,
+                    "action_id": action_id,
+                    "risk": risk.value,
+                    "result": self._tool_jobs.confirmation_prompt(name, args, risk),
+                },
+            )
+
+        job = self._tool_jobs.create(str(fc.id), name, args)
+        self._turn_used_tool = True
+        self._set_dialogue_state(DialogueState.TOOL_RUNNING, name)
+        return await self._tool_jobs.run(job, lambda: self._execute_tool_impl(fc))
+
+    async def _execute_tool_impl(self, fc) -> types.FunctionResponse:
         name = fc.name
         args = dict(fc.args or {})
 
@@ -1084,38 +1390,22 @@ class JarvisLive:
         loop = asyncio.get_event_loop()
 
         def callback(indata, frames, time_info, status):
-            with self._speaking_lock:
-                jarvis_speaking = self._is_speaking
-            if jarvis_speaking or self.ui.muted or self._phone_active:
+            if self.ui.muted or self._phone_active or not self._mic_queue:
                 return
-
             data = indata.tobytes()
-            if self._wake_operational:
-                if self._wake_gate_open.is_set():
-                    if self._audio_is_voice(data):
-                        self._wake_turn_in_progress = True
-                        self._wake_deadline = time.monotonic() + max(
-                            2.0, self._wake_settings.follow_up_timeout
-                        )
-                    loop.call_soon_threadsafe(self._queue_realtime_audio, data)
-                else:
-                    self._wake_pre_roll.append(data)
-                    if self._wake_queue and self._wake_detector is not None:
-                        def _put_wake():
-                            try:
-                                self._wake_queue.put_nowait(data)
-                            except asyncio.QueueFull:
-                                try:
-                                    self._wake_queue.get_nowait()
-                                except Exception:
-                                    pass
-                                try:
-                                    self._wake_queue.put_nowait(data)
-                                except asyncio.QueueFull:
-                                    pass
-                        loop.call_soon_threadsafe(_put_wake)
-            else:
-                loop.call_soon_threadsafe(self._queue_realtime_audio, data)
+            def _put():
+                try:
+                    self._mic_queue.put_nowait(data)
+                except asyncio.QueueFull:
+                    try:
+                        self._mic_queue.get_nowait()
+                    except Exception:
+                        pass
+                    try:
+                        self._mic_queue.put_nowait(data)
+                    except asyncio.QueueFull:
+                        pass
+            loop.call_soon_threadsafe(_put)
 
         try:
             with sd.InputStream(
@@ -1132,6 +1422,95 @@ class JarvisLive:
             print(f"[JARVIS] ❌ Mic: {e}")
             raise
 
+    async def _process_microphone_audio(self):
+        """Condition mic audio locally and emit explicit Gemini activity signals."""
+        while True:
+            raw = await self._mic_queue.get()
+            if not self._voice_engine:
+                await asyncio.sleep(0)
+                continue
+            try:
+                event = await asyncio.to_thread(self._voice_engine.process_microphone, raw)
+            except Exception as exc:
+                print(f"[VoiceEngine] process error: {exc}")
+                continue
+
+            data = event.audio
+            if self._wake_operational and not self._wake_gate_open.is_set():
+                self._wake_calibration.observe_ambient(event.rms)
+                self._wake_pre_roll.append(data)
+                if self._wake_detector:
+                    try:
+                        detected = await asyncio.to_thread(self._wake_detector.process_bytes, data)
+                    except Exception as exc:
+                        print(f"[WakeWord] detector error: {exc}")
+                        detected = False
+                    if detected:
+                        self._wake_calibration.observe_wake(event.rms)
+                        self._activate_wake_word()
+                        await self._send_activity_start()
+                        self._local_speech_active = True
+                        self._current_user_audio = bytearray()
+                        self._speech_started_at = time.monotonic()
+                        self._voice_metrics.increment("vad_starts")
+                        while self._wake_pre_roll:
+                            buffered = self._wake_pre_roll.popleft()
+                            self._current_user_audio.extend(buffered)
+                            self._queue_realtime_audio(buffered)
+                        if not event.is_speech:
+                            self._local_speech_active = False
+                            self._speech_ended_at = time.monotonic()
+                            self._voice_metrics.increment("vad_ends")
+                            await self._send_activity_end()
+                continue
+
+            if not self._wake_operational and not self._wake_gate_open.is_set():
+                self._wake_gate_open.set()
+
+            if event.speech_started and not self._local_speech_active:
+                self._local_speech_active = True
+                self._current_user_audio = bytearray()
+                self._speech_started_at = time.monotonic()
+                self._voice_metrics.increment("vad_starts")
+                self._set_dialogue_state(DialogueState.USER_SPEAKING, "local VAD")
+                with self._speaking_lock:
+                    speaking = self._is_speaking
+                if speaking:
+                    self.interrupt(auto=True)
+                await self._send_activity_start()
+                while self._wake_pre_roll:
+                    self._queue_realtime_audio(self._wake_pre_roll.popleft())
+
+            if self._local_speech_active:
+                self._current_user_audio.extend(data)
+                self._queue_realtime_audio(data)
+
+            if event.speech_ended and self._local_speech_active:
+                self._local_speech_active = False
+                self._speech_ended_at = time.monotonic()
+                self._voice_metrics.increment("vad_ends")
+                self._last_user_audio = bytes(self._current_user_audio)
+                self._current_user_audio.clear()
+                self._last_speaker_verified = False
+                self._last_speaker_score = 0.0
+                if (
+                    self._speaker_enabled
+                    and self._speaker_identity
+                    and self._speaker_identity.enrolled
+                    and len(self._last_user_audio) >= SEND_SAMPLE_RATE * 2
+                ):
+                    try:
+                        verified, score = await asyncio.to_thread(
+                            self._speaker_identity.verify, self._last_user_audio
+                        )
+                        self._last_speaker_verified = verified
+                        self._last_speaker_score = score
+                    except Exception as exc:
+                        print(f"[SpeakerIdentity] verification skipped: {exc}")
+                self._wake_turn_in_progress = True
+                self._set_dialogue_state(DialogueState.MODEL_THINKING, "speech ended")
+                await self._send_activity_end()
+
     async def _receive_audio(self):
         print("[JARVIS] 👂 Recv started")
         out_buf, in_buf = [], []
@@ -1140,12 +1519,32 @@ class JarvisLive:
             while True:
                 async for response in self.session.receive():
 
+                    if response.session_resumption_update:
+                        update = response.session_resumption_update
+                        if update.resumable and update.new_handle:
+                            self._session_handle = update.new_handle
+
+                    if response.go_away:
+                        self._planned_reconnect = True
+                        self.ui.write_log("SYS: Live session rotating seamlessly...")
+                        raise RuntimeError("__SESSION_RECONNECT__")
+
+                    if response.tool_call_cancellation:
+                        for call_id in response.tool_call_cancellation.ids or []:
+                            self._tool_jobs.cancel_call(str(call_id))
+
                     if response.data:
                         if self._interrupted:
                             pass  # discard: interrupted
                         else:
                             if self._turn_done_event and self._turn_done_event.is_set():
                                 self._turn_done_event.clear()
+                            if self._speech_ended_at:
+                                self._voice_metrics.observe(
+                                    "speech_to_response_ms",
+                                    (time.monotonic() - self._speech_ended_at) * 1000.0,
+                                )
+                                self._speech_ended_at = 0.0
                             # Split into ~50 ms chunks so interrupt() stops audio within 50 ms
                             # (24000 Hz × 2 bytes/sample × 0.05 s = 2400 bytes per slice)
                             _audio_data = response.data
@@ -1208,9 +1607,16 @@ class JarvisLive:
 
                             if self._wake_operational and self._wake_gate_open.is_set():
                                 self._wake_turn_in_progress = False
-                                self._wake_deadline = time.monotonic() + self._wake_settings.follow_up_timeout
+                                follow_up = ConversationStateManager.follow_up_seconds(
+                                    full_in,
+                                    self._wake_settings.follow_up_timeout,
+                                    tool_used=self._turn_used_tool,
+                                    vision_used=bool(self._pending_vision or self._vision_close_pending),
+                                )
+                                self._wake_deadline = time.monotonic() + follow_up
+                                self._turn_used_tool = False
                                 if not self.ui.muted:
-                                    self.ui.set_state("FOLLOW_UP")
+                                    self._set_dialogue_state(DialogueState.FOLLOW_UP, "turn complete")
 
                             # Vision injection: model finished tool-response turn → now send the image
                             if self._pending_vision and self.session:
@@ -1284,10 +1690,13 @@ class JarvisLive:
                         and self.audio_in_queue.empty()
                     ):
                         self.set_speaking(False)
+                        self._last_playback_started_at = 0.0
                         self._turn_done_event.clear()
                     continue
 
                 self.set_speaking(True)
+                if not self._last_playback_started_at:
+                    self._last_playback_started_at = time.monotonic()
 
                 # Batch all immediately-available chunks into one write to reduce
                 # thread-pool round-trips (was one asyncio.to_thread per 50ms slice).
@@ -1300,6 +1709,10 @@ class JarvisLive:
                         break
 
                 try:
+                    if self._voice_engine:
+                        await asyncio.to_thread(
+                            self._voice_engine.feed_playback, bytes(batch), RECEIVE_SAMPLE_RATE
+                        )
                     await asyncio.to_thread(stream.write, bytes(batch))
                 except (RuntimeError, asyncio.CancelledError):
                     break   # executor shutting down — exit cleanly
@@ -1565,23 +1978,41 @@ class JarvisLive:
     # ── Phone audio relay ────────────────────────────────────────────────────────
 
     async def _relay_phone_audio(self) -> None:
-        """Forward phone mic PCM chunks from dashboard queue into the Gemini Live session."""
+        """Apply the same explicit local VAD semantics to phone microphone audio."""
         q = self._dashboard._phone_audio_queue
         while True:
             try:
                 chunk = await asyncio.wait_for(q.get(), timeout=1.0)
             except asyncio.TimeoutError:
-                # No audio for 1 s → phone mic inactive, give PC mic back
+                if self._phone_speech_active:
+                    self._phone_speech_active = False
+                    await self._send_activity_end()
                 self._phone_active = False
                 continue
-            self._phone_active = True   # phone is streaming — silence PC mic
-            with self._speaking_lock:
-                speaking = self._is_speaking
-            if not speaking and not self.ui.muted:
-                try:
-                    self.out_queue.put_nowait(chunk)
-                except asyncio.QueueFull:
-                    pass
+
+            self._phone_active = True
+            if self.ui.muted or not self._voice_engine:
+                continue
+            try:
+                event = await asyncio.to_thread(self._voice_engine.process_microphone, chunk["data"])
+            except Exception as exc:
+                print(f"[Phone] Voice processing error: {exc}")
+                continue
+
+            if event.speech_started and not self._phone_speech_active:
+                self._phone_speech_active = True
+                with self._speaking_lock:
+                    speaking = self._is_speaking
+                if speaking:
+                    self.interrupt(auto=True)
+                await self._send_activity_start()
+
+            if self._phone_speech_active:
+                self._queue_realtime_audio(event.audio)
+
+            if event.speech_ended and self._phone_speech_active:
+                self._phone_speech_active = False
+                await self._send_activity_end()
 
     def _on_phone_connected(self) -> None:
         self.ui.write_log("SYS: Phone connected via Remote Dashboard.")
@@ -1653,6 +2084,7 @@ class JarvisLive:
                     self.audio_in_queue   = asyncio.Queue()
                     self.out_queue        = asyncio.Queue(maxsize=200)
                     self._wake_queue       = asyncio.Queue(maxsize=100)
+                    self._mic_queue           = asyncio.Queue(maxsize=100)
                     self._turn_done_event = asyncio.Event()
 
                     # Reset transient state that must not carry over from a previous session
@@ -1672,9 +2104,10 @@ class JarvisLive:
 
                     tg.create_task(self._send_realtime())
                     tg.create_task(self._listen_audio())
+                    tg.create_task(self._process_microphone_audio())
                     tg.create_task(self._receive_audio())
                     tg.create_task(self._play_audio())
-                    tg.create_task(self._wake_detector_loop())
+                    # Wake detection is fed by the conditioned microphone loop.
                     tg.create_task(self._wake_timeout_loop())
                     tg.create_task(self._run_system_monitor())
                     tg.create_task(self._run_background_monitor())
@@ -1712,6 +2145,11 @@ class JarvisLive:
                     _conn_backoff = 3
                     continue
 
+                if "__SESSION_RECONNECT__" in err_str:
+                    self._conn_backoff = 0
+                    self._voice_metrics.increment("reconnects")
+                    continue
+
                 # Network / timeout errors — log clearly and back off
                 is_net_err = any(k in err_str for k in (
                     "TimeoutError", "timed out", "getaddrinfo", "CancelledError",
@@ -1728,6 +2166,7 @@ class JarvisLive:
                     self._conn_backoff = 3
             finally:
                 self.session = None
+                self._planned_reconnect = False
                 # Only save if there was a real conversation (≥3 turns)
                 if len(self._session_log) >= 3:
                     asyncio.create_task(self._save_session_summary())
